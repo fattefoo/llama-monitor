@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+*.egg
+
+# Virtualenv
+.venv/
+venv/
+env/
+pyvenv.cfg
+
+# Tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cov
+.coverage
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
