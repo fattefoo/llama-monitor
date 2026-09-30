@@ -2,6 +2,7 @@
 
 import json
 import os
+import sys
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Optional, TYPE_CHECKING
@@ -45,6 +46,10 @@ class _APIHandler(BaseHTTPRequestHandler):
             self._handle_restart()
         elif self.path == "/api/v1/set-template":
             self._handle_set_template()
+        elif self.path == "/api/v1/llm-stop":
+            self._handle_llm_stop()
+        elif self.path == "/api/v1/llm-start":
+            self._handle_llm_start()
         elif self.path == "/api/v1/shutdown":
             self._handle_shutdown()
         else:
@@ -70,6 +75,7 @@ class _APIHandler(BaseHTTPRequestHandler):
                 "restart_timeout_sec": config["restart_timeout_sec"],
             },
             "templates_count": len(list_template_names()),
+            "llm_stopped": state.llm_stopped,
         })
     
     def _handle_templates(self):
@@ -186,6 +192,51 @@ class _APIHandler(BaseHTTPRequestHandler):
                 os._exit(1)
         
         threading.Thread(target=_force_kill, daemon=True, name="shutdown-force-kill").start()
+
+
+def _handle_llm_stop(self):
+    """Stop the running llama-server via the API and keep it stopped."""
+    from llama_monitor.daemon import get_global_state
+    from llama_monitor.config import load_config, save_llm_stopped
+    
+    state = get_global_state()
+    config = load_config()
+    
+    # Persist the stopped flag so the daemon keeps it stopped (survives restart)
+    state.llm_stopped = True
+    try:
+        save_llm_stopped(True)
+    except Exception as e:
+        print(f"Warning: could not persist llm_stopped: {e}", file=sys.stderr)
+    if state.llm_stop_event:
+        state.llm_stop_event.set()
+    
+    self._send_json(200, {
+        "success": True,
+        "message": "llama-server stop requested; daemon will not restart it.",
+    })
+
+
+def _handle_llm_start(self):
+    """Start the llama-server via the API and resume monitoring."""
+    from llama_monitor.daemon import get_global_state
+    from llama_monitor.config import save_llm_stopped
+    
+    state = get_global_state()
+    
+    # Clear the stopped flag so the daemon resumes normal monitoring (survives restart)
+    state.llm_stopped = False
+    try:
+        save_llm_stopped(False)
+    except Exception as e:
+        print(f"Warning: could not persist llm_stopped: {e}", file=sys.stderr)
+    if state.llm_start_event:
+        state.llm_start_event.set()
+    
+    self._send_json(200, {
+        "success": True,
+        "message": "llama-server start requested; daemon will resume monitoring.",
+    })
 
 
 def start_api_server(port: int, host: str = "127.0.0.1") -> None:

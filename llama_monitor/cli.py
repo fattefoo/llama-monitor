@@ -123,6 +123,12 @@ def main():
     # set — interactive selector to set active_template
     set_parser = subparsers.add_parser("set", help="Set the active template")
     
+    # llm-stop — signal daemon to stop the llama-server and keep it stopped
+    subparsers.add_parser("llm-stop", help="Stop llama-server (daemon won't restart it)")
+
+    # llm-start — signal daemon to start the llama-server and resume monitoring
+    subparsers.add_parser("llm-start", help="Start llama-server (daemon resumes monitoring)")
+
     # logs — show daemon and llama-server logs
     logs_parser = subparsers.add_parser("logs", help="Show daemon and llama-server logs")
     logs_parser.add_argument("lines", nargs="?", type=int, default=40, help="Number of lines to show (default: 40)")
@@ -167,6 +173,10 @@ def main():
         cmd_set()
     elif command == "logs":
         cmd_logs(args.lines)
+    elif command == "llm-stop":
+        cmd_llm_stop()
+    elif command == "llm-start":
+        cmd_llm_start()
     else:
         parser.print_help()
         sys.exit(1)
@@ -670,6 +680,7 @@ def cmd_status(as_json: bool = False):
             print(f"  llama-server PID: {api_status['pid']}")
             print(f"  Process state: {api_status.get('state', 'unknown')}")
             print(f"  Health: {api_status.get('health', 'unknown')}")
+        print(f"  llm stopped: {api_status.get('llm_stopped', 'False')}")
         
         # Running model from /v1/models
         if llama_server_model_info:
@@ -1353,6 +1364,37 @@ def cmd_logs(lines: int):
     except FileNotFoundError:
         print("Error: journalctl not found. Is systemd running?", file=sys.stderr)
         sys.exit(1)
+
+
+def _api_post(path: str) -> bool:
+    """POST to the daemon API and return success/failure."""
+    import httpx
+    
+    try:
+        with httpx.Client(timeout=5) as client:
+            resp = client.post(f"http://127.0.0.1:9500{path}")
+            if resp.status_code == 200:
+                return True
+            print(f"API error: {resp.status_code} - {resp.text}", file=sys.stderr)
+            return False
+    except httpx.ConnectError:
+        print("Cannot connect to llama-monitor daemon. Is it running?", file=sys.stderr)
+        print("Try: sudo systemctl start llama-monitor", file=sys.stderr)
+        return False
+
+
+def cmd_llm_stop():
+    """Ask the daemon to stop the llama-server and keep it stopped."""
+    print("Stopping llama-server (daemon will not restart it until 'llm-start')...")
+    success = _api_post("/api/v1/llm-stop")
+    sys.exit(0 if success else 1)
+
+
+def cmd_llm_start():
+    """Ask the daemon to start the llama-server and resume monitoring."""
+    print("Starting llama-server (daemon resumes monitoring)...")
+    success = _api_post("/api/v1/llm-start")
+    sys.exit(0 if success else 1)
 
 
 if __name__ == "__main__":

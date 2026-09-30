@@ -45,6 +45,10 @@ class DaemonState:
     server_owned: bool = False  # True if we started this server ourselves
     restart_event: threading.Event = field(default_factory=threading.Event)
     shutdown_event: threading.Event = field(default_factory=threading.Event)
+    # llm-stop / llm-start: daemon-driven stop/start of the llama-server.
+    llm_stopped: bool = False      # True when llm-stop requested → don't restore the server
+    llm_stop_event: threading.Event = field(default_factory=threading.Event)
+    llm_start_event: threading.Event = field(default_factory=threading.Event)
 
 
 def get_global_state() -> DaemonState:
@@ -202,6 +206,10 @@ class Daemon:
         self._current_port: int = 8080
         # PID of the server we ourselves started (for stop/kill decisions)
         self.started_server_pid: Optional[int] = None
+        # Events for llm-stop / llm-start (assigned in run_daemon after the
+        # global state is created).
+        self.llm_stop_event: threading.Event = None
+        self.llm_start_event: threading.Event = None
     
     def start(self, template_name: str) -> bool:
         """Start llama-server with the given template."""
@@ -338,11 +346,27 @@ class Daemon:
         If an external llama-server is already running on the template port,
         we only monitor it. If health fails, we take over: kill and restart.
         If no server is running, we start a new one.
+        When llm_stopped is True (llm-stop), the daemon leaves the
+        llama-server stopped and does NOT restore it — resume happens on
+        llm-start.
         """
         from llama_monitor.health import await_health
         from llama_monitor.process_monitor import get_process_state, is_process_zombie
         
         state = get_global_state()
+        
+        # llm-stop: daemon-driven stop. Leave the server stopped; the daemon
+        # must not restore it. Resume only after llm-start clears the flag.
+        if state.llm_stopped:
+            pid = state.pid
+            if pid and state.process_state not in ("stopped", "killing"):
+                print("llm-stop active: stopping llama-server "
+                      "(daemon will not restart it).", flush=True)
+                self.stop(timeout_sec=self.config["restart_timeout_sec"])
+            elif not pid:
+                state.process_state = "stopped"
+            return
+        
         pid = state.pid
         
         # Check if any server is running on our template port
@@ -445,11 +469,19 @@ def run_daemon(config: dict) -> None:
     
     daemon = Daemon(config)
     _global_state = DaemonState()
+    # Wire the daemon's stop/start events to the shared global-state events.
+    daemon.llm_stop_event = _global_state.llm_stop_event
+    daemon.llm_start_event = _global_state.llm_start_event
     
     # Restore active_template from config
     active_template = config.get("active_template", "")
     if active_template:
         _global_state.active_template = active_template
+    
+    # Restore llm-stop state from config (survives daemon restart)
+    _global_state.llm_stopped = config.get("llm_stopped", False)
+    if _global_state.llm_stopped:
+        print("Restored llm-stop state: daemon started with llama-server stopped.", flush=True)
     
     def handle_signal(signum, frame):
         print(f"\nReceived signal {signum}, shutting down...", flush=True)
@@ -506,6 +538,32 @@ def run_daemon(config: dict) -> None:
                 _global_state.restart_event.clear()
                 print("Restart signal received.", flush=True)
                 daemon.restart()
+                continue
+            
+            # Check for llm-stop signal
+            if _global_state.llm_stop_event.is_set():
+                _global_state.llm_stop_event.clear()
+                print("llm-stop signal received.", flush=True)
+                _global_state.llm_stopped = True
+                try:
+                    from llama_monitor.config import save_llm_stopped
+                    save_llm_stopped(True)
+                except Exception as e:
+                    print(f"Could not persist llm_stopped: {e}", file=sys.stderr)
+                daemon.check_and_recover()
+                continue
+            
+            # Check for llm-start signal
+            if _global_state.llm_start_event.is_set():
+                _global_state.llm_start_event.clear()
+                print("llm-start signal received.", flush=True)
+                _global_state.llm_stopped = False
+                try:
+                    from llama_monitor.config import save_llm_stopped
+                    save_llm_stopped(False)
+                except Exception as e:
+                    print(f"Could not persist llm_stopped: {e}", file=sys.stderr)
+                daemon.check_and_recover()
                 continue
             
             # Check for shutdown signal

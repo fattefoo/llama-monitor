@@ -86,6 +86,7 @@ def load_config() -> Dict[str, Any]:
         "restart_timeout_sec": int(raw.get("restart_timeout_sec", 10)),
         "daemon_port": int(raw.get("daemon_port", 9500)),
         "active_template": raw.get("active_template", ""),
+        "llm_stopped": bool(raw.get("llm_stopped", False)),
     }
     
     # Optional log_file
@@ -180,6 +181,20 @@ def save_active_template(template_name: str) -> None:
         raise ConfigError(f"Template '{template_name}' not found in templates directory")
     
     raw["active_template"] = template_name
+    
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(raw, f, indent=4)
+
+
+def save_llm_stopped(value: bool) -> None:
+    """Persist the llm-stop state so it survives a daemon restart."""
+    if not CONFIG_FILE.exists():
+        raise ConfigError(f"Config file not found: {CONFIG_FILE}")
+    
+    with open(CONFIG_FILE, "r") as f:
+        raw = json.load(f)
+    
+    raw["llm_stopped"] = bool(value)
     
     with open(CONFIG_FILE, "w") as f:
         json.dump(raw, f, indent=4)

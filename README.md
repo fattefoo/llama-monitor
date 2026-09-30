@@ -12,7 +12,7 @@ configurable per-template binary, port, and llama.cpp parameters.
 llama-monitor (Python daemon)
 ├── CLI: start/stop/restart/status/list-templates
 ├── systemd: autostart, restart=always, journalctl logging
-├── HTTP API (port 9500): /api/v1/status, /api/v1/templates, /api/v1/restart
+├── HTTP API (port 9500): /api/v1/status, /api/v1/templates, /api/v1/set-template, /api/v1/restart, /api/v1/llm-stop, /api/v1/llm-start, /api/v1/shutdown
 └── Hermes integration: /llama list, /llama set, /llama status (separate plugin)
 ```
 
@@ -123,7 +123,41 @@ sudo llama-monitor --enable-autostart
 sudo llama-monitor --disable-autostart
 ```
 
-### Hermes Gateway Integration
+### llm-stop / llm-start
+
+`llm-stop` and `llm-start` give manual control over the running llama-server
+*without* fighting the daemon's auto-restart. Both are daemon-driven: the
+CLI posts to the daemon's HTTP API and the daemon's main loop does the work.
+
+```bash
+# Stop the llama-server and KEEP it stopped. The daemon will NOT restart it
+# (whereas a health-check failure normally brings it back).
+llama-monitor llm-stop
+
+# Bring the llama-server back up and let the daemon resume normal monitoring.
+llama-monitor llm-start
+```
+
+Behavior:
+
+- **`llm-stop`** — sets an internal `llm_stopped` flag and stops the
+  llama-server. On every subsequent health-check cycle the daemon short-circuits
+  (`check_and_recover()` returns early), so a crashed or health-failing
+  llama-server stays stopped until `llm-start` is issued.
+- **`llm-start`** — clears the flag and starts the llama-server; the daemon
+  resumes its regular health checking and auto-recovery.
+- The flag is persisted to `config.json` (`"llm_stopped": true/false`) so it
+  survives a daemon restart: starting the daemon after a `llm-stop` starts with
+  the llama-server already stopped.
+- Set via the HTTP API too: `/api/v1/llm-stop` and `/api/v1/llm-start`.
+- `status` shows `llm stopped: true|false` reflecting the flag.
+
+```bash
+# Check the current state
+llama-monitor status
+```
+
+## Health Checking
 
 The Hermes plugin (`hermes-llama-monitor`) provides these slash commands via the Hermes Gateway:
 
