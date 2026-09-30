@@ -1,0 +1,6 @@
+Metadata-Version: 2.4
+Name: llama-monitor
+Version: 0.1.0
+Summary: llama-server process monitor with health checking and systemd integration
+Requires-Python: >=3.10
+Requires-Dist: httpx<1,>=0.28

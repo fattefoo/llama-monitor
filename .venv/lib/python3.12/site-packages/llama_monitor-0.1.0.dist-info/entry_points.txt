@@ -1,0 +1,2 @@
+[console_scripts]
+llama-monitor = llama_monitor.main:main

@@ -1,0 +1,17 @@
+[Unit]
+Description=Llama Server Monitor
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/llama-monitor start
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+Environment=PYTHONUNBUFFERED=1
+LogsDirectory=llama-monitor
+WorkingDirectory=/home/n4rf/.config/llama-monitor
+
+[Install]
+WantedBy=multi-user.target
