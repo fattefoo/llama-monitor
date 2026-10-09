@@ -176,6 +176,14 @@ def main():
     create_from_parser = subparsers.add_parser("create-from", help="Create a new template from an existing one")
     create_from_parser.add_argument("template", nargs="?", default=None, help="Source template to copy from (default: interactive selection)")
 
+    # edit — change, add or remove parameters of an existing template
+    # Optional positional: edit [parameter_key]
+    edit_parser = subparsers.add_parser(
+        "edit", help="Edit parameters of an existing template")
+    edit_parser.add_argument(
+        "parameter", nargs="?", default=None,
+        help="Parameter to edit (default: walk all parameters)")
+
     # delete — interactive wizard to delete an existing template
     delete_parser = subparsers.add_parser("delete", help="Delete an existing template")
     delete_parser.add_argument("template", nargs="?", default=None, help="Template name to delete (default: interactive selection)")
@@ -228,6 +236,8 @@ def main():
         cmd_create_base()
     elif command == "create-from":
         cmd_create_from(args.template)
+    elif command == "edit":
+        cmd_edit(args.parameter)
     elif command == "delete":
         cmd_delete(args.template)
     elif command == "models":
@@ -1018,20 +1028,25 @@ def _prompt_binary_selection(default_binary=None):
     return default_binary
 
 
-def _collect_parameters(template, ask_all=None):
+def _collect_parameters(template, ask_all=None, ask_binary=True):
     """Interactively prompt for the binary + all template parameters.
 
     Uses the current values in ``template`` as defaults and updates
     ``template`` in place. Returns the template.
 
-    Every parameter llama-server is invoked with (see
-    ``daemon._build_llama_args``) has an entry in :data:`PARAM_SPECS`. Where a
-    parameter has defined values it is offered as a numbered select list with
-    a trailing "custom" entry that prompts for a free-form value; otherwise a
-    plain free-form prompt is used.
+    Parameters come from ``params.PARAM_SPECS``, adapted to the selected
+    llama-server build by :func:`_runtime_specs`. Prompting walks the table
+    group by group; inside a group only parameters that are meaningful for the
+    values chosen so far are asked, so (for example) ``spec_draft_n_max`` is
+    only offered when a draft-model spec type is selected. A parameter that
+    becomes irrelevant is removed from the template, and anything left at
+    llama-server's own default can be dropped before saving.
     """
-    # Binary selection
-    binaries = _find_llama_servers()
+    from llama_monitor.params import (CORE_KEYS, GROUPS, PARAM_SPECS,
+                                      PARAM_FLAGS, SPEC_BY_KEY, is_default)
+
+    # Binary selection (the build decides which parameters apply)
+    binaries = _find_llama_servers() if ask_binary else []
     if binaries:
         default_bin = template.get("binary") or binaries[0]
         chosen = _prompt_binary_selection(default_bin)
@@ -1041,197 +1056,97 @@ def _collect_parameters(template, ask_all=None):
 
     if ask_all is None:
         ask_all = _prompt_yes(
-            "  Configure every supported llama-server parameter?", default=True)
+            "  Configure llama-server parameters?", default=True)
 
     if not ask_all:
         return template
 
-    specs = _runtime_specs(template.get("binary"))
-    if not specs:
-        specs = PARAM_SPECS
+    specs = _runtime_specs(template.get("binary")) or PARAM_SPECS
 
-    current_group = None
-    for spec in specs:
-        if spec.key not in template and not spec.always_ask:
-            continue
-        if spec.group != current_group:
-            current_group = spec.group
-            print(f"\n--- {current_group} ---")
+    # Offer the core knobs first, then let the user walk every remaining
+    # parameter of the selected build group by group.
+    core = [s for s in specs if s.key in CORE_KEYS or s.always_ask]
+    extra = [s for s in specs if s.key not in CORE_KEYS and not s.always_ask]
 
-        current = template.get(spec.key, spec.default)
-        value = _prompt_spec(spec, current)
-        if value is not None:
-            template[spec.key] = value
+    def show(group_specs):
+        """Prompt for each spec, skipping the ones that do not apply."""
+        for spec in group_specs:
+            if not spec.active(template):
+                continue
+            current = template.get(spec.key, spec.default)
+            value = _prompt_spec(spec, current)
+            if value is not None:
+                template[spec.key] = value
 
+    _prompt_groups(core, template, show)
+
+    remaining = [s for s in extra if s.active(template)
+                 or s.key in template]
+    if remaining:
+        print()
+        if _prompt_yes(f"  Show {len(remaining)} additional parameter(s) "
+                       "this build supports?", default=False):
+            _prompt_groups(remaining, template, show)
+
+    _finalize_template(template, PARAM_SPECS, PARAM_FLAGS, SPEC_BY_KEY,
+                       is_default)
     return template
 
 
-class _ParamSpec:
-    """One llama-server parameter offered by the wizard."""
+def _prompt_groups(specs, template, show):
+    """Walk the table group by group, offering each group as a block.
 
-    __slots__ = ("key", "label", "kind", "options", "default", "group",
-                 "always_ask", "help")
+    Applicability is re-checked inside ``show`` right before each prompt, so
+    changing a value (enabling a spec type, say) still exposes the parameters
+    it unlocks later in the same group.
+    """
+    from llama_monitor.params import GROUPS
 
-    def __init__(self, key, label, kind="int", options=None, default=None,
-                 group="Other", always_ask=False, help=""):
-        self.key = key
-        self.label = label
-        self.kind = kind  # int | float | bool | str | select
-        self.options = options or []  # list of (value, display)
-        self.default = default
-        self.group = group
-        self.always_ask = always_ask  # ask even if absent from the template
-        self.help = help
+    for group in GROUPS:
+        group_specs = [s for s in specs if s.group == group]
+        applicable = [s for s in group_specs if s.active(template)]
+        if not applicable:
+            continue
 
-
-def _ctx_options():
-    """Standard context sizes: n*1024 tokens for n in 8..256."""
-    return [(n * 1024, f"{n}k ({n * 1024})") for n in range(8, 257)]
-
-
-_CACHE_TYPES = [
-    "f32", "f16", "bf16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0",
-    "iq4_nl", "iq4_xs", "turbo2", "turbo3", "turbo4",
-]
-
-PARAM_SPECS = [
-    # --- Server ---
-    _ParamSpec("port", "Port", kind="int", default=8080, group="Server",
-               always_ask=True, help="TCP port llama-server listens on"),
-    _ParamSpec("bind", "Bind address", kind="select", default="127.0.0.1",
-               options=[("127.0.0.1", "127.0.0.1 (localhost only)"),
-                        ("0.0.0.0", "0.0.0.0 (all interfaces)"),
-                        ("::", ":: (all interfaces, IPv6)")],
-               group="Server", always_ask=True, help="--host"),
-
-    # --- Model loading ---
-    _ParamSpec("ctx_size", "Context size", kind="select", default=262144,
-               options=_ctx_options(), group="Model loading",
-               always_ask=True, help="--ctx-size, in tokens"),
-    _ParamSpec("n_gpu_layers", "GPU layers", kind="int", default=99,
-               group="Model loading", help="-1 = all, 0 = CPU only"),
-    _ParamSpec("n_cpu_moe", "CPU MoE layers", kind="int", default=41,
-               group="Model loading", help="Mixture-of-experts layers kept on CPU"),
-    _ParamSpec("flash_attn", "Flash attention", kind="select", default="on",
-               options=[("on", "on"), ("off", "off"), ("auto", "auto")],
-               group="Model loading"),
-    _ParamSpec("load_mode", "Load mode", kind="select", default="mmap+mlock",
-               options=[("mmap", "mmap"), ("mlock", "mlock"),
-                        ("mmap+mlock", "mmap+mlock")],
-               group="Model loading"),
-
-    # --- KV cache ---
-    _ParamSpec("cache_type_k", "Cache type K", kind="select", default="f16",
-               options=[(t, t) for t in _CACHE_TYPES], group="KV cache"),
-    _ParamSpec("cache_type_v", "Cache type V", kind="select", default="f16",
-               options=[(t, t) for t in _CACHE_TYPES], group="KV cache"),
-
-    # --- Sampling ---
-    _ParamSpec("temperature", "Temperature", kind="float", default=1.0,
-               group="Sampling"),
-    _ParamSpec("top_p", "Top-p", kind="float", default=0.95, group="Sampling"),
-    _ParamSpec("top_k", "Top-k", kind="int", default=40, group="Sampling"),
-    _ParamSpec("min_p", "Min-p", kind="float", default=0.05, group="Sampling"),
-    _ParamSpec("mirostat", "Mirostat", kind="select", default=0,
-               options=[(0, "0 (disabled)"), (1, "1"), (2, "2")],
-               group="Sampling"),
-    _ParamSpec("mirostat_lr", "Mirostat learning rate (tau)", kind="float",
-               default=0.1, group="Sampling"),
-    _ParamSpec("mirostat_ent", "Mirostat target entropy (eta)", kind="float",
-               default=5.0, group="Sampling"),
-    _ParamSpec("repeat_last_n", "Repeat last-n", kind="int", default=64,
-               group="Sampling"),
-    _ParamSpec("repeat_penalty", "Repeat penalty", kind="float", default=1.0,
-               group="Sampling"),
-    _ParamSpec("frequency_penalty", "Frequency penalty", kind="float", default=0.0,
-               group="Sampling"),
-    _ParamSpec("presence_penalty", "Presence penalty", kind="float", default=0.0,
-               group="Sampling"),
-    _ParamSpec("seed", "Seed", kind="int", default=0,
-               group="Sampling", help="0 = random"),
-    _ParamSpec("logit_bias", "Logit bias", kind="str", default="",
-               group="Sampling", help='e.g. "token_id:-100"'),
-
-    # --- Speculative decoding ---
-    _ParamSpec("spec_type", "Spec type", kind="select", default="none",
-               options=[("none", "none (disabled)"),
-                        ("draft-model", "draft-model"),
-                        ("draft-min", "draft-min"),
-                        ("draft-max", "draft-max"),
-                        ("draft-mtp", "draft-mtp"),
-                        ("draft-tmtp", "draft-tmtp")],
-               group="Speculative decoding"),
-    _ParamSpec("spec_draft_n_max", "Draft n-max", kind="int", default=2,
-               group="Speculative decoding"),
-
-    # --- Server features ---
-    _ParamSpec("jinja", "Jinja chat template", kind="bool", default=True,
-               group="Server features", always_ask=True),
-    _ParamSpec("metrics", "Metrics endpoint", kind="bool", default=True,
-               group="Server features", always_ask=True),
-    _ParamSpec("chat_format", "Chat format", kind="select", default="",
-               options=[("", "server default (unset)"), ("chatml", "chatml"),
-                        ("llama2", "llama2"), ("llama3", "llama3"),
-                        ("zephyr", "zephyr"), ("mistral-instruct", "mistral-instruct"),
-                        ("gemma", "gemma"), ("phi3", "phi3"), ("qwen", "qwen")],
-               group="Server features"),
-
-    # --- Multi-GPU / distributed ---
-    _ParamSpec("parallel", "Parallel slots", kind="int", default=1,
-               group="Multi-GPU / distributed", always_ask=True,
-               help="-1 = auto"),
-    _ParamSpec("split_mode", "Split mode", kind="select", default="none",
-               options=[("none", "none (single GPU)"), ("layer", "layer"),
-                        ("row", "row")],
-               group="Multi-GPU / distributed"),
-    _ParamSpec("tensor_split", "Tensor split", kind="str", default="",
-               group="Multi-GPU / distributed", help='e.g. "3,1"'),
-    _ParamSpec("main_gpu", "Main GPU index", kind="int", default=0,
-               group="Multi-GPU / distributed"),
-
-    # --- LoRA ---
-    _ParamSpec("lora", "LoRA adapter", kind="str", default="",
-               group="LoRA", help="path to the LoRA adapter"),
-]
-
-_CUSTOM = object()
+        plural = "s" if len(applicable) != 1 else ""
+        print(f"\n=== {group} ({len(applicable)} parameter{plural}) ===")
+        if not _prompt_yes(f"  Configure {group}?", default=True):
+            print("  (unchanged)")
+            continue
+        show(group_specs)
 
 
-# JSON key -> long llama-server flag, mirroring daemon._build_llama_args.
-_PARAM_FLAGS = {
-    "port": "--port",
-    "bind": "--host",
-    "ctx_size": "--ctx-size",
-    "n_gpu_layers": "--n-gpu-layers",
-    "n_cpu_moe": "--n-cpu-moe",
-    "flash_attn": "--flash-attn",
-    "load_mode": "--load-mode",
-    "cache_type_k": "--cache-type-k",
-    "cache_type_v": "--cache-type-v",
-    "temperature": "--temp",
-    "top_p": "--top-p",
-    "top_k": "--top-k",
-    "min_p": "--min-p",
-    "mirostat": "--mirostat",
-    "mirostat_lr": "--mirostat-lr",
-    "mirostat_ent": "--mirostat-ent",
-    "repeat_last_n": "--repeat-last-n",
-    "repeat_penalty": "--repeat-penalty",
-    "frequency_penalty": "--frequency-penalty",
-    "presence_penalty": "--presence-penalty",
-    "seed": "--seed",
-    "logit_bias": "--logit-bias",
-    "spec_type": "--spec-type",
-    "spec_draft_n_max": "--spec-draft-n-max",
-    "jinja": "--jinja",
-    "metrics": "--metrics",
-    "chat_format": "--chat-format",
-    "parallel": "--parallel",
-    "split_mode": "--split-mode",
-    "tensor_split": "--tensor-split",
-    "main_gpu": "--main-gpu",
-    "lora": "--lora",
-}
+# Keys the daemon always passes explicitly, so they are never pruned.
+_ALWAYS_KEEP = {"port", "bind", "name", "model_path", "binary"}
+
+
+def _finalize_template(template, PARAM_SPECS, PARAM_FLAGS, SPEC_BY_KEY, is_default):
+    """Drop irrelevant parameters and (optionally) llama-server defaults."""
+    stale = [spec.key for spec in PARAM_SPECS
+             if spec.key in template and not spec.active(template)]
+    for key in stale:
+        del template[key]
+    if stale:
+        print(f"\nRemoved {len(stale)} inapplicable parameter(s): {', '.join(stale)}")
+
+    # Legacy key from older llama-server builds.
+    legacy = template.pop("chat_format", None)
+    if legacy and not template.get("chat_template"):
+        template["chat_template"] = legacy
+        print(f"Migrated chat_format -> chat_template ({legacy})")
+
+    defaults = [key for key, value in template.items()
+                if key not in _ALWAYS_KEEP and key in PARAM_FLAGS
+                and is_default(SPEC_BY_KEY[key], value)]
+    if not defaults:
+        return
+    if _prompt_yes(
+            f"  Drop {len(defaults)} parameter(s) left at llama-server defaults?",
+            default=True):
+        for key in defaults:
+            del template[key]
+        print(f"  -> {', '.join(sorted(defaults))}")
+
 
 _HELP_CACHE: dict = {}
 
@@ -1324,10 +1239,13 @@ def _is_value_list(values) -> bool:
 def _runtime_specs(binary: Optional[str]) -> list:
     """Adapt PARAM_SPECS to the selected llama-server build.
 
-    Parameters the build does not advertise are dropped, and select lists are
-    refreshed from the value sets the build itself documents. Falls back to the
-    static PARAM_SPECS when the binary cannot be queried.
+    Parameters the build does not advertise are dropped, select lists are
+    refreshed from the value sets the build itself documents, and a boolean's
+    "--no-x" form is dropped when the build has none. Falls back to the static
+    table when the binary cannot be queried.
     """
+    from llama_monitor.params import PARAM_SPECS
+
     if not binary:
         return PARAM_SPECS
     help_text = _llama_server_help(binary)
@@ -1336,37 +1254,57 @@ def _runtime_specs(binary: Optional[str]) -> list:
 
     specs = []
     for spec in PARAM_SPECS:
-        flag = _PARAM_FLAGS.get(spec.key)
-        if flag and flag not in help_text:
+        if spec.flag not in help_text:
             continue  # not supported by this build
 
-        if flag:
-            values = _help_flag_values(help_text, flag)
+        updates = {}
+        if spec.kind == "select":
+            values = _help_flag_values(help_text, spec.flag)
             if values:
-                options = [(v, v) for v in values]
                 if spec.key == "split_mode":
-                    options = [(v, v) for v in values if v != "tensor"]
-                if spec.key == "spec_type":
-                    options = [(v, v) for v in values]
-                spec = _ParamSpec(
-                    spec.key, spec.label,
-                    kind="select" if spec.key not in ("cache_type_k", "cache_type_v")
-                         else spec.kind,
-                    options=options if options else spec.options,
-                    default=spec.default, group=spec.group,
-                    always_ask=spec.always_ask, help=spec.help)
-        specs.append(spec)
-    return specs
+                    values = [v for v in values if v != "tensor"]
+                # The build's own list is authoritative (it knows about build
+                # specific extras such as the turbo quant types); keep the
+                # static "unset" and current-default entries, which --help
+                # never lists.
+                merged = []
+                seen = set()
 
+                def add(value, display):
+                    if str(value) in seen:
+                        return
+                    seen.add(str(value))
+                    merged.append((value, display))
+
+                for value, display in spec.options:
+                    if value == "":
+                        add(value, display)
+                for value in values:
+                    add(value, value)
+                # The server default is always accepted, even when --help
+                # documents it only in the "(default: ...)" note.
+                if spec.default is not None:
+                    add(spec.default, spec.default)
+                if merged:
+                    updates["options"] = merged
+        if spec.off_flag and spec.off_flag not in help_text:
+            updates["off_flag"] = None
+
+        specs.append(spec.clone(**updates) if updates else spec)
+    return specs
 
 def _prompt_spec(spec, current):
     """Prompt for one parameter. Returns the new value, or None to keep current."""
+    label = f"{spec.label} {spec.flag}"
     if spec.kind == "select" and spec.options:
         return _prompt_select(spec, current)
 
     if spec.kind == "bool":
-        print(f"  {spec.label}: {'on' if current else 'off'}"
-              f"{'  ' + spec.help if spec.help else ''}")
+        note = spec.help
+        if not spec.off_flag and spec.default:
+            note = (note + "; " if note else "") + "no --no- flag in this build"
+        print(f"  {label}: {'on' if current else 'off'}"
+              f"{'  ' + note if note else ''}")
         if _prompt_yes(f"    {spec.label}?", default=bool(current)):
             return True
         return False
@@ -1374,7 +1312,7 @@ def _prompt_spec(spec, current):
     kind_label = {"int": "integer", "float": "number", "str": "text"}.get(
         spec.kind, "value")
     suffix = f"  ({spec.help})" if spec.help else ""
-    val = _prompt_input(f"  {spec.label}{suffix} [{kind_label}]",
+    val = _prompt_input(f"  {label}{suffix} [{kind_label}]",
                         None if current is None else str(current))
     if val is None:
         return current
@@ -1413,7 +1351,7 @@ def _prompt_select(spec, current):
             current_index = i
             break
 
-    print(f"\n  {spec.label}{suffix}  [current: {_display_value(current)}]")
+    print(f"\n  {spec.label} {spec.flag}{suffix}  [current: {_display_value(current)}]")
     _print_numbered(options, current_index)
     print(f"    {custom_index:>3}. custom value...")
 
@@ -1424,19 +1362,24 @@ def _prompt_select(spec, current):
     try:
         index = int(raw)
     except ValueError:
-        return _coerce(spec.kind, raw, current)
+        # Not a number: treat it as a custom value.
+        return _coerce_select(spec, raw, current)
 
     if index == custom_index:
         val = _prompt_input(f"    Custom {spec.label} value", None)
         if val is None or val == "":
             return current
-        return _coerce(spec.kind, val, current)
+        return _coerce_select(spec, val, current)
 
     if 1 <= index <= len(options):
         return options[index - 1][0]
 
-    print(f"    Invalid selection. Use 1-{custom_index}.")
-    return current
+    # Out of range: a number this large is a custom value, not a typo.
+    val = _prompt_input(f"    Custom {spec.label} value (1-{custom_index}, or a value)", None)
+    if val is None or val == "":
+        print(f"    Invalid selection. Use 1-{custom_index}.")
+        return current
+    return _coerce_select(spec, val, current)
 
 
 def _display_value(value) -> str:
@@ -1449,6 +1392,19 @@ def _values_equal(a, b) -> bool:
     if a is None or b is None:
         return a is b or (not a and not b)
     return str(a) == str(b)
+
+
+def _coerce_select(spec, raw, fallback):
+    """Coerce a custom select entry to the type of the spec's own values.
+
+    ``ctx_size`` is a select over integers, so a typed-in "262144" must land as
+    an int rather than the string a plain free-form prompt would produce.
+    """
+    sample = next((v for v, _ in spec.options if isinstance(v, int)), None)
+    kind = "int" if sample is not None else spec.kind
+    if kind == "int":
+        kind = "float" if any(isinstance(v, float) for v, _ in spec.options) else "int"
+    return _coerce(kind, raw, fallback)
 
 
 def _coerce(kind, raw, fallback):
@@ -1616,6 +1572,274 @@ def cmd_create_from(template_name: Optional[str] = None):
     print(f"  From: {source_name}")
     print(f"  Model: {selected_model.name}")
     print(f"  To activate: llama-monitor reload-template {template_name}")
+
+
+def _select_template(action: str):
+    """List the templates and return the one the user picks.
+
+    Returns the template name, or None when the user aborts.
+    """
+    from llama_monitor.config import list_template_names, load_template
+
+    templates = list_template_names()
+    if not templates:
+        print("No templates available.")
+        sys.exit(1)
+
+    print(f"\nAvailable templates:")
+    for i, name in enumerate(templates, 1):
+        try:
+            tpl = load_template(name)
+            model_name = os.path.basename(tpl.get("model_path", "unknown"))
+            port = tpl.get("port", 8080)
+            print(f"  {i}. {name} (model: {model_name}, port: {port})")
+        except Exception as e:
+            print(f"  {i}. {name} (error: {e})")
+
+    sel = _prompt_input(f"Select template to {action}", "1")
+    try:
+        idx = int(sel) - 1
+    except ValueError:
+        print("Aborted.")
+        return None
+    if not 0 <= idx < len(templates):
+        print(f"Invalid selection. Use 1-{len(templates)}.")
+        return None
+    return templates[idx]
+
+
+def _resolve_parameter(name: str):
+    """Look up a spec by template key or llama-server flag.
+
+    Returns ``(spec, note)``. ``note`` explains a flag rejected by the
+    selected build, in which case ``spec`` is None.
+    """
+    from llama_monitor.params import PARAM_SPECS, SPEC_BY_KEY
+
+    specs = _runtime_specs(None)
+    available = {spec.key: spec for spec in specs}
+
+    raw = name.strip().lstrip("-")
+    if raw.startswith("no-"):
+        raw = raw[3:]  # accept the negated spelling, e.g. --no-jinja
+    key = raw
+    for candidate in (raw, raw.replace("-", "_")):
+        if candidate in available:
+            return available[candidate], None
+        if candidate in SPEC_BY_KEY:
+            return None, (f"Parameter '{candidate}' ({SPEC_BY_KEY[candidate].flag}) "
+                          f"is not supported by the selected llama-server build.")
+    # Separators are optional: "cachetypek" and "cache-type-k" both work.
+    squashed = key.replace("_", "").replace("-", "")
+    for candidate in available:
+        if candidate.replace("_", "") == squashed:
+            return available[candidate], None
+    for candidate in SPEC_BY_KEY:
+        if candidate.replace("_", "") == squashed:
+            return None, (f"Parameter '{candidate}' ({SPEC_BY_KEY[candidate].flag}) "
+                          f"is not supported by the selected llama-server build.")
+    for spec in PARAM_SPECS:
+        if spec.flag == name or spec.flag == f"--{key}":
+            return available.get(spec.key), (
+                f"Parameter '{spec.key}' ({spec.flag}) is not supported by "
+                f"the selected llama-server build."
+                if spec.key not in available else None)
+
+    note = "Unknown parameter."
+    close = _close_keys(key, available)
+    if close:
+        note += " Did you mean: " + ", ".join(close[:8]) + "?"
+    return None, note
+
+
+def _close_keys(key: str, available: dict) -> list:
+    """Parameter keys that ``key`` plausibly refers to.
+
+    Substring matches first, then a subsequence match so ``top_ky`` and
+    ``ctxsize`` still find ``top_k`` and ``ctx_size``.
+    """
+    needle = key.lower().replace("-", "").replace("_", "")
+    if not needle:
+        return []
+
+    def normalized(name: str) -> str:
+        return name.lower().replace("_", "")
+
+    contains = [k for k in available if needle in normalized(k)]
+    if contains:
+        return contains
+
+    def is_subsequence(short, long):
+        it = iter(long)
+        return all(ch in it for ch in short)
+
+    # Subsequence matching gets noisy ("ctxt" would hit every ctx_* key), so
+    # require the first two characters to line up.
+    prefix = needle[:2]
+    subsequence = [k for k in available
+                   if normalized(k).startswith(prefix)
+                   and is_subsequence(needle, normalized(k))]
+    if subsequence:
+        return subsequence
+
+    # Last resort: catch typos like "top_ky" or "ctxsize".
+    import difflib
+    return difflib.get_close_matches(needle, list(available), n=3, cutoff=0.7)
+
+
+def _edit_single_parameter(template, name):
+    """Prompt for exactly one parameter and apply it to ``template``.
+
+    Returns True when the template changed.
+    """
+    from llama_monitor.params import (PARAM_SPECS, PARAM_FLAGS, SPEC_BY_KEY,
+                                      is_default)
+
+    spec, note = _resolve_parameter(name)
+    if spec is None:
+        if note:
+            print(f"  {note}")
+        return False
+
+    changed = False
+    if not spec.active(template):
+        try:
+            changed = bool(_prompt_prerequisites(spec, template))
+        except _Aborted:
+            print("  Aborted.")
+            return False
+        if not changed:
+            return False
+
+    present = spec.key in template
+    current = template.get(spec.key, spec.default)
+    default_note = ""
+    if not present:
+        default_note = f" [not set; llama-server default: {_display_value(spec.default)}]"
+
+    print(f"\n{spec.label} {spec.flag}{default_note}")
+    value = _prompt_spec(spec, current)
+
+    if value is not None and not _values_equal(value, current):
+        template[spec.key] = value
+        print(f"  -> {spec.key} = {value!r}")
+        changed = True
+        if is_default(spec, value):
+            print(f"  Note: {value!r} is llama-server's default for {spec.key}.")
+    elif present:
+        # Nothing new chosen: offer removal as the other way to "edit".
+        if _prompt_yes(f"  Remove {spec.key} from the template?", default=False):
+            del template[spec.key]
+            print(f"  -> removed {spec.key}")
+            changed = True
+    elif value is not None and is_default(spec, value):
+        # The chosen value matches llama-server's default, so it would normally
+        # stay out of the template — ask, since naming it explicitly is a valid
+        # way to pin a value.
+        if _prompt_yes(f"  Store {spec.key} anyway (it equals the "
+                       f"llama-server default)?", default=False):
+            template[spec.key] = value
+            print(f"  -> {spec.key} = {value!r}")
+            changed = True
+
+    return changed
+
+
+class _Aborted(Exception):
+    """Raised when the user declines a prompt that was a prerequisite."""
+
+
+def _prompt_prerequisites(spec, template, _depth=0):
+    """Ask for the related parameters ``spec`` depends on, until it applies.
+
+    Mutates ``template`` and returns the list of keys changed. Raises
+    :class:`_Aborted` when the user declines, and returns ``[]`` when no
+    prerequisite can be offered.
+    """
+    from llama_monitor.params import SPEC_BY_KEY, dependencies_of
+
+    keys = dependencies_of(spec, template)
+    reason = ", ".join(f"{k}={template.get(k, '')!r}" for k in keys)
+    print(f"\n{spec.key} ({spec.flag}) does not apply to this template"
+          f"{f' because {reason}' if reason else ''}.")
+
+    changed = []
+    for key in keys:
+        prereq = SPEC_BY_KEY.get(key)
+        if prereq is None:
+            continue
+        current = template.get(key, prereq.default)
+        print(f"  {key} is currently {_display_value(current)!r}")
+        value = _prompt_spec(prereq, current)
+        if value is None or _values_equal(value, current):
+            continue
+        template[key] = value
+        print(f"  -> {key} = {value!r}")
+        changed.append(key)
+
+    if spec.active(template) or not keys:
+        return changed
+
+    # Still inactive: the prerequisite may itself be gated. Recurse rather than
+    # hardcoding a chain.
+    if _depth < 3:
+        for key in keys:
+            prereq = SPEC_BY_KEY.get(key)
+            if prereq is not None and not prereq.active(template):
+                changed += _prompt_prerequisites(prereq, template, _depth + 1)
+
+    if not spec.active(template):
+        print(f"  {spec.key} still does not apply with these values.")
+        raise _Aborted()
+    return changed
+
+
+def _save_template(template, template_name):
+    from llama_monitor.config import TEMPLATES_DIR
+
+    output_file = TEMPLATES_DIR / f"{template_name}.json"
+    with open(output_file, "w") as f:
+        json.dump(template, f, indent=4)
+    print(f"\n✓ Template saved: {output_file}")
+    print(f"  To apply it: llama-monitor reload-template {template_name}")
+    return output_file
+
+
+def cmd_edit(parameter: Optional[str] = None):
+    """Edit the parameters of an existing template.
+
+    ``llama-monitor edit`` walks every parameter of the selected template with
+    the same wizard used to create one, so values can be changed, added and
+    removed. ``llama-monitor edit <name>`` prompts for just that one parameter.
+    """
+    from llama_monitor.config import list_template_names, load_template
+
+    templates = list_template_names()
+    if not templates:
+        print("No templates to edit.")
+        sys.exit(1)
+
+    # Step 1: always let the user select the template to edit.
+    template_name = _select_template("edit")
+    if not template_name:
+        sys.exit(1)
+
+    template = load_template(template_name)
+    print(f"\nEditing: {template_name}")
+    if template.get("name"):
+        print(f"  Model: {template.get('name')}")
+
+    # Step 2: edit the named parameter, or walk the wizard.
+    if parameter:
+        changed = _edit_single_parameter(template, parameter)
+        if not changed:
+            print("\nNothing changed.")
+            return
+        _save_template(template, template_name)
+        return
+
+    _collect_parameters(template, ask_all=True)
+    _save_template(template, template_name)
 
 
 def cmd_delete(template_name: Optional[str] = None):

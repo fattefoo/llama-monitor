@@ -209,7 +209,8 @@ class TestBuildLlamaArgs:
         assert "--presence-penalty" in args
         assert "--mirostat" in args
         assert "--mirostat-lr" in args
-        assert "--mirostat-ent" in args
+        # --mirostat-ent only applies to Mirostat 1; mirostat is 2 here.
+        assert "--mirostat-ent" not in args
         assert "--split-mode" in args
         assert "--main-gpu" in args
         assert "--tensor-split" in args

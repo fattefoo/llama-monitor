@@ -94,33 +94,68 @@ All optional fields are passed as `--flag value` arguments to the llama-server.
 
 ### Parameter names
 
-Each JSON key maps to one llama-server flag. The mapping is defined in
-`_build_llama_args()` (`llama_monitor/daemon.py`) and mirrored in `_PARAM_FLAGS`
-(`llama_monitor/cli.py`) for the wizard.
+Every template key maps to exactly one llama-server flag. Both the wizard and
+the daemon read that mapping from a single table, `PARAM_SPECS` in
+`llama_monitor/params.py`:
+
+| Field | Meaning |
+| --- | --- |
+| `key` | JSON key in the template |
+| `flag` | llama-server flag (`--ctx-size`) |
+| `kind` | `int`, `float`, `bool`, `str` or `select` |
+| `default` | llama-server's own default; used to prune the template |
+| `options` | choices offered for a `select` |
+| `off_flag` | negated form for booleans (`--no-webui`) |
+| `when` | predicate that disables the parameter when it does not apply |
+
+`_build_llama_args()` (`llama_monitor/daemon.py`) walks this table to emit the
+flags, and the wizard (`llama_monitor/cli.py`) walks it to build its prompts,
+so a parameter only has to be declared once.
+
+Some examples of what the table covers:
 
 | Template key | llama-server flag |
 | --- | --- |
 | `port` / `bind` | `--port` / `--host` |
-| `ctx_size` | `--ctx-size` |
-| `n_gpu_layers` | `--n-gpu-layers` |
-| `n_cpu_moe` | `--n-cpu-moe` |
-| `flash_attn` | `--flash-attn` |
-| `load_mode` | `--load-mode` |
-| `cache_type_k` / `cache_type_v` | `--cache-type-k` / `--cache-type-v` |
-| `temperature` | `--temp` |
-| `top_p` / `top_k` / `min_p` | `--top-p` / `--top-k` / `--min-p` |
-| `seed` / `logit_bias` | `--seed` / `--logit-bias` |
-| `mirostat` | `--mirostat` |
-| `mirostat_lr` / `mirostat_ent` | `--mirostat-lr` / `--mirostat-ent` |
-| `repeat_last_n` | `--repeat-last-n` |
-| `repeat_penalty` | `--repeat-penalty` |
-| `frequency_penalty` | `--frequency-penalty` |
-| `presence_penalty` | `--presence-penalty` |
-| `spec_type` / `spec_draft_n_max` | `--spec-type` / `--spec-draft-n-max` |
-| `jinja` / `metrics` | `--jinja` / `--metrics` (boolean flags) |
-| `parallel` | `--parallel` |
+| `ctx_size` / `parallel` | `--ctx-size` / `--parallel` |
+| `n_gpu_layers` / `n_cpu_moe` | `--n-gpu-layers` / `--n-cpu-moe` |
 | `split_mode` / `main_gpu` / `tensor_split` | `--split-mode` / `--main-gpu` / `--tensor-split` |
-| `lora` | `--lora` |
+| `flash_attn` / `load_mode` / `fit` | `--flash-attn` / `--load-mode` / `--fit` |
+| `cache_type_k` / `cache_type_v` | `--cache-type-k` / `--cache-type-v` |
+| `temperature` / `top_p` / `top_k` / `min_p` | `--temp` / `--top-p` / `--top-k` / `--min-p` |
+| `mirostat` / `mirostat_lr` / `mirostat_ent` | `--mirostat` / `--mirostat-lr` / `--mirostat-ent` |
+| `repeat_last_n` / `repeat_penalty` | `--repeat-last-n` / `--repeat-penalty` |
+| `frequency_penalty` / `presence_penalty` | `--frequency-penalty` / `--presence-penalty` |
+| `spec_type` / `spec_draft_n_max` / `spec_draft_model` | `--spec-type` / `--spec-draft-n-max` / `--spec-draft-model` |
+| `spec_ngram_mod_n_max` / `spec_ngram_simple_size_n` | `--spec-ngram-mod-n-max` / `--spec-ngram-simple-size-n` |
+| `lora` / `lora_scaled` / `control_vector` | `--lora` / `--lora-scaled` / `--control-vector` |
+| `mmproj` / `mmproj_device` | `--mmproj` / `--mmproj-device` |
+| `jinja` / `webui` / `metrics` / `slots` | `--jinja` / `--webui` / `--metrics` / `--slots` |
+| `chat_template` / `chat_template_kwargs` | `--chat-template` / `--chat-template-kwargs` |
+| `api_key` / `cors_origins` / `ssl_key_file` | `--api-key` / `--cors-origins` / `--ssl-key-file` |
+
+Run `python -c "from llama_monitor.params import PARAM_SPECS as P; print(len(P))"`
+for the current count.
+
+#### Parameters that do not apply
+
+A parameter is only asked for — and only emitted — when it is meaningful for
+the other values in the template. The `when` predicates encode this:
+
+- `spec_draft_*` needs a `draft-*` spec type (`spec_type: "none"` or an ngram
+  type disables all of them; each `spec_ngram_*` key needs its own ngram type).
+- `mirostat_lr` needs `mirostat > 0`; `mirostat_ent` only applies to Mirostat
+  1, so it is dropped for `mirostat: 2`.
+- `top_k`, `top_p`, `top_nsigma` and `typical_p` are dropped when Mirostat is
+  on, because llama-server ignores them.
+- `dry_*` need `dry_multiplier > 0`, `xtc_threshold` needs
+  `xtc_probability > 0`, `yarn_*` need `rope_scaling: "yarn"`,
+  `tensor_split` needs `split_mode != "none"`, `pooling` and `embd_normalize`
+  need `embedding: true`.
+
+The daemon applies the same predicates, so a stale key in an existing template
+is skipped rather than passed as a contradictory flag. The wizard also offers to
+drop every key left at llama-server's own default before saving.
 
 > **Renamed keys.** Earlier versions used `penalty_last_n`, `penalty_repeat`,
 > `penalty_freq`, `penalty_present`, `mirostat_tau`, `mirostat_eta`,
@@ -129,6 +164,9 @@ Each JSON key maps to one llama-server flag. The mapping is defined in
 > fail to launch. They are now `repeat_last_n`, `repeat_penalty`,
 > `frequency_penalty`, `presence_penalty`, `mirostat_lr`, `mirostat_ent`,
 > `main_gpu` and `lora` as listed above. Update existing templates accordingly.
+>
+> `chat_format` was also removed; use `chat_template`. The wizard migrates it
+> automatically when you next edit a template.
 
 ## Usage
 
@@ -182,11 +220,84 @@ llama-monitor create-from                # copy an existing template
 llama-monitor create-from qwen36_35b     # copy a named template
 ```
 
-Both wizards ask for the binary, the model, the template name and then walk
-**every** llama-server parameter, grouped into Server, Model loading, KV cache,
-Sampling, Speculative decoding, Server features, Multi-GPU/distributed and
-LoRA. Answer `n` at the "Configure every supported llama-server parameter?"
-prompt to skip the walk and keep the source template's values.
+Both wizards ask for the binary, the model, the template name and then walk the
+parameters in groups — Server, Access control, Server features, Chat,
+Context & cache, KV cache, CPU & threads, GPU & offload, Multimodal, LoRA,
+Sampling, DRY sampling, Mirostat, Speculative decoding and Logging.
+
+The core knobs (port, bind, context size, GPU layers, KV cache types,
+sampling, spec type, ...) are always offered. After those, the wizard asks
+whether to show the ~130 further parameters the selected binary supports.
+Answer `n` at the "Configure llama-server parameters?" prompt to skip the walk
+and keep the source template's values.
+
+**Only relevant parameters are asked.** Applicability is re-evaluated as you go,
+so choosing `spec_type: draft-mtp` reveals `spec_draft_n_max`,
+`spec_draft_model` and the other draft-model parameters, while `none` or an
+ngram type hides them. Enabling Mirostat hides `top_k`/`top_p` (llama-server
+ignores them) and reveals `mirostat_lr`. See
+[Parameters that do not apply](#parameters-that-do-not-apply) for the full set
+of rules. Keys that no longer apply are removed from the template, and before
+saving you are offered to drop everything still sitting at llama-server's own
+default so the template only records what actually differs.
+
+**Context size** is a select list of `n*1024` tokens for `n` from 8 to 256 in
+steps of 8 (32 entries), printed six per row, plus `0 (from model)`. A
+non-standard size can still be typed through the `custom value...` entry.
+
+### Editing a template
+
+`edit` changes, adds or removes parameters of an existing template. It always
+starts by letting you pick the template to edit.
+
+```bash
+llama-monitor edit                  # walk every parameter of the template
+llama-monitor edit ctx_size         # edit just one parameter
+llama-monitor edit --spec-draft-n-max
+```
+
+`edit` with no argument runs the same wizard as `create-base`, seeded with the
+template's current values, so parameters can be changed and removed. Keys that
+no longer apply are dropped, and you are again offered to remove everything
+left at a llama-server default.
+
+`edit <name>` prompts for exactly one parameter, which is handy for a quick
+change without walking 14 groups. The name is the template key (`ctx_size`),
+but the llama-server flag also works, with or without a leading `--` and with
+the negated form (`--no-webui` resolves to `webui`). Unknown names get a
+suggestion, so a typo like `top_ky` points at `top_k`.
+
+Three things can happen depending on the state of the parameter:
+
+- **Present and changed** — the new value is written.
+- **Present and left alone** — you are asked whether to remove it from the
+  template instead.
+- **Not present** — the value is added, along with a note when it equals
+  llama-server's default (in which case you can still choose to store it
+  explicitly).
+
+If the parameter does not apply to the template's current values, `edit` says
+so and prompts for the parameter it depends on, recursing through the chain if
+needed:
+
+```
+$ llama-monitor edit spec_draft_n_max
+
+Editing: qwen35_4b_crow
+
+spec_draft_n_max (--spec-draft-n-max) does not apply to this template
+because spec_type=''.
+
+  spec_type --spec-type  (comma-separated list of methods)  [current: (unset)]
+  ...
+  -> spec_type = draft-mtp
+
+spec_draft_n_max --spec-draft-n-max [not set; llama-server default: 3]
+  spec_draft_n_max --spec-draft-n-max  (number of tokens to draft) [integer] [3]
+```
+
+Which parameters gate which is derived from the same `when` predicates the rest
+of the wizard uses, so this follows the table automatically.
 
 **Select lists.** Any parameter with defined values is offered as a numbered
 list with the current value marked (`◀ current`) and a final
@@ -194,7 +305,7 @@ list with the current value marked (`◀ current`) and a final
 a defined value set get a plain typed prompt that re-asks on invalid input.
 
 ```
-  Cache type K  (--cache-type-k)  [current: turbo4]
+  cache_type_k --cache-type-k  [current: turbo4]
       1. f32        2. f16        3. bf16        4. q8_0   ◀ current
       5. q4_0       6. q4_1       7. iq4_nl      8. q5_0
       9. q5_1      10. turbo2    11. turbo3     12. turbo4
@@ -202,14 +313,13 @@ a defined value set get a plain typed prompt that re-asks on invalid input.
     Selection [12]
 ```
 
-**Context size** is a select list of `n*1024` tokens for `n` from 8 to 256
-(249 entries), printed six per row.
-
 **Runtime introspection.** The wizard adapts itself to the selected binary: it
 runs `<binary> --help` once (cached per binary) and then
 
-- drops parameters the build does not advertise, and
-- refreshes the select lists from the value sets the build itself documents.
+- drops parameters the build does not advertise,
+- refreshes the select lists from the value sets the build itself documents,
+  keeping the static "unset" entry and the current default, and
+- drops the `--no-x` form of a boolean when the build has none.
 
 It handles all four formats llama.cpp uses for enumerated values: the inline
 `--flash-attn [on|off|auto]` and `--split-mode {none,layer,row,tensor}` forms,

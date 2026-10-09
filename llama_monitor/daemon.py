@@ -133,56 +133,45 @@ def find_llama_server_by_port(port: int) -> Optional[dict]:
 
 def _build_llama_args(template: dict, config: dict) -> list:
     """Build llama-server CLI arguments from template.
-    
-    Supports all llama-server parameters. Key-value pairs use the JSON key
-    mapped to the long-form flag (e.g. "n_cpu_moe" → "--n-cpu-moe").
-    Boolean flags (no value) use keys like "no_mmap": true.
+
+    Driven by ``params.PARAM_SPECS``: every parameter the wizard can produce is
+    emitted from one place, so the flag name lives in a single table.
+
+    - Key-value parameters are emitted as ``--flag value`` when present.
+    - Booleans emit ``--flag`` when true and, when the build supports it,
+      ``--off_flag`` when false (e.g. ``--no-webui``).
+    - Parameters whose ``when`` predicate is false are skipped, so a template
+      that still carries (for example) ``spec_draft_n_max`` from an earlier
+      spec_type never passes a flag that contradicts the current values.
     """
+    from llama_monitor.params import PARAM_SPECS
+
     binary = template.get("binary", config["default_binary"])
     bind = template.get("bind", "127.0.0.1")
     port = template.get("port", 8080)
-    
+
     args = [binary]
     args.extend(["--model", template["model_path"]])
     args.extend(["--host", bind])
     args.extend(["--port", str(port)])
-    
-    # --- Key-value parameters ---
-    _add_kv(args, template, "ctx_size", "--ctx-size")
-    _add_kv(args, template, "n_gpu_layers", "--n-gpu-layers")
-    _add_kv(args, template, "n_cpu_moe", "--n-cpu-moe")
-    _add_kv(args, template, "parallel", "--parallel")
-    _add_kv(args, template, "spec_type", "--spec-type")
-    _add_kv(args, template, "spec_draft_n_max", "--spec-draft-n-max")
-    _add_kv(args, template, "cache_type_k", "--cache-type-k")
-    _add_kv(args, template, "cache_type_v", "--cache-type-v")
-    _add_kv(args, template, "chat_format", "--chat-format")
-    _add_kv(args, template, "temperature", "--temp")
-    _add_kv(args, template, "top_p", "--top-p")
-    _add_kv(args, template, "top_k", "--top-k")
-    _add_kv(args, template, "min_p", "--min-p")
-    _add_kv(args, template, "seed", "--seed")
-    _add_kv(args, template, "logit_bias", "--logit-bias")
-    _add_kv(args, template, "repeat_last_n", "--repeat-last-n")
-    _add_kv(args, template, "repeat_penalty", "--repeat-penalty")
-    _add_kv(args, template, "frequency_penalty", "--frequency-penalty")
-    _add_kv(args, template, "presence_penalty", "--presence-penalty")
-    _add_kv(args, template, "mirostat", "--mirostat")
-    _add_kv(args, template, "mirostat_lr", "--mirostat-lr")
-    _add_kv(args, template, "mirostat_ent", "--mirostat-ent")
-    _add_kv(args, template, "split_mode", "--split-mode")
-    _add_kv(args, template, "main_gpu", "--main-gpu")
-    _add_kv(args, template, "tensor_split", "--tensor-split")
-    _add_kv(args, template, "lora", "--lora")
-    _add_kv(args, template, "flash_attn", "--flash-attn")
-    _add_kv(args, template, "load_mode", "--load-mode")
-    
-    # --- Boolean flags ---
-    if template.get("jinja"):
-        args.append("--jinja")
-    if template.get("metrics"):
-        args.append("--metrics")
-    
+
+    for spec in PARAM_SPECS:
+        key = spec.key
+        if key in ("port", "bind") or key not in template:
+            continue
+        if not spec.active(template):
+            continue
+        value = template[key]
+        if spec.kind == "bool":
+            if value:
+                args.append(spec.flag)
+            elif spec.off_flag:
+                args.append(spec.off_flag)
+            continue
+        if value is None or value == "":
+            continue
+        args.extend([spec.flag, str(value)])
+
     return args
 
 
