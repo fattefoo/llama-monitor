@@ -188,38 +188,32 @@ class TestBuildLlamaArgs:
         template = {
             "model_path": "/path/to/model.gguf",
             "logit_bias": '{"1234": -1.0}',
-            "penalty_last_n": 64,
-            "penalty_repeat": 1.0,
-            "penalty_freq": 0.5,
-            "penalty_present": 0.3,
+            "repeat_last_n": 64,
+            "repeat_penalty": 1.0,
+            "frequency_penalty": 0.5,
+            "presence_penalty": 0.3,
             "mirostat": 2,
-            "mirostat_tau": 5.0,
-            "mirostat_eta": 0.1,
-            "split_mode": 1,
-            "row_split": 1,
+            "mirostat_lr": 0.1,
+            "mirostat_ent": 5.0,
+            "split_mode": "layer",
+            "main_gpu": 0,
             "tensor_split": "[0.5, 0.5]",
-            "lora_base": "/path/to/lora-base",
-            "lora_path": "/path/to/lora",
-            "num_gpu": 2,
-            "rpc": "tcp://localhost:5555",
+            "lora": "/path/to/lora",
         }
         args = _build_llama_args(template, config)
         
         assert "--logit-bias" in args
-        assert "--penalty-last-n" in args
-        assert "--penalty-repeat" in args
-        assert "--penalty-freq" in args
-        assert "--penalty-penalty" in args  # Note: --penalty-present → --penalty-penalty
+        assert "--repeat-last-n" in args
+        assert "--repeat-penalty" in args
+        assert "--frequency-penalty" in args
+        assert "--presence-penalty" in args
         assert "--mirostat" in args
-        assert "--mirostat-tau" in args
-        assert "--mirostat-eta" in args
+        assert "--mirostat-lr" in args
+        assert "--mirostat-ent" in args
         assert "--split-mode" in args
-        assert "--row-split" in args
+        assert "--main-gpu" in args
         assert "--tensor-split" in args
-        assert "--lora-base" in args
-        assert "--lora-path" in args
-        assert "--num-gpu" in args
-        assert "--rpc" in args
+        assert "--lora" in args
 
 
 class TestAddKv:

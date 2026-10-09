@@ -5,6 +5,7 @@
 import argparse
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -14,13 +15,75 @@ from typing import Optional
 
 
 def _require_sudo():
-    """Ensure the command runs as root. If not, re-execute with sudo."""
+    """Ensure the command runs as root, avoiding a terminal password prompt.
+
+    If not root, re-execute the same command through ``pkexec`` so a graphical
+    polkit authentication dialog is shown instead of a terminal prompt.
+    ``pkexec`` sanitizes the environment (notably PYTHONPATH), so the
+    re-execution goes through an explicit interpreter call that injects the
+    package root onto ``sys.path``.
+
+    Returns without re-executing when the command can be completed without
+    elevation (see :func:`_needs_privileges`); the caller is then responsible
+    for handling that path itself.
+    """
     if os.geteuid() == 0:
         return  # Already root
-    
-    # Re-run the full command with sudo — the system will prompt for password.
-    result = subprocess.run(["sudo"] + sys.argv)
+
+    if not _needs_privileges(sys.argv[1:]):
+        return  # Caller can handle this command unprivileged (API path)
+
+    _elevate(sys.argv[1:])
+
+
+def _elevate(argv):
+    """Re-execute this CLI as root via pkexec (GUI dialog) or sudo."""
+    import shutil
+
+    package_root = str(Path(__file__).resolve().parent.parent)
+
+    if _has_graphical_session() and shutil.which("pkexec"):
+        bootstrap = (
+            "import sys; sys.path.insert(0, sys.argv.pop(1)); "
+            "from llama_monitor.main import main; main()"
+        )
+        cmd = [shutil.which("pkexec"), sys.executable, "-c", bootstrap,
+               package_root] + list(argv)
+        result = subprocess.run(cmd)
+        # 126/127: program could not be executed or authorization could not
+        # be obtained (no dialog agent available). Fall through to sudo.
+        if result.returncode not in (126, 127):
+            sys.exit(result.returncode)
+        print("pkexec could not authenticate (no dialog agent?). Falling back to sudo.",
+              file=sys.stderr)
+
+    sudo = shutil.which("sudo")
+    if not sudo:
+        print("Error: need root privileges but neither pkexec nor sudo is available.",
+              file=sys.stderr)
+        sys.exit(1)
+    result = subprocess.run([sudo, sys.executable, "-m", "llama_monitor.main"] + list(argv))
     sys.exit(result.returncode)
+
+
+def _needs_privileges(argv) -> bool:
+    """True if this invocation cannot be served by the daemon API alone.
+
+    ``stop`` only needs to reach the daemon's HTTP API, which the running
+    (root) daemon serves to any local user, so it is handled unprivileged.
+    ``start`` and ``restart`` genuinely need root: they spawn the daemon
+    process themselves and there is no API endpoint that can do that.
+    """
+    for arg in argv:
+        if arg.startswith("-"):
+            continue
+        return arg != "stop"
+    return True
+
+
+def _has_graphical_session() -> bool:
+    """True if a graphical polkit agent could display an authentication dialog."""
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
 def _get_home_dir() -> str:
@@ -376,31 +439,74 @@ def cmd_start():
     run_daemon(config)
 
 
+def _stop_via_api():
+    """Shut the daemon down through its HTTP API (no root needed)."""
+    import httpx
+
+    print("Shutting down via daemon API...")
+    try:
+        with httpx.Client(timeout=5) as client:
+            resp = client.post("http://127.0.0.1:9500/api/v1/shutdown")
+    except httpx.ConnectError:
+        print("Cannot connect to daemon API.", file=sys.stderr)
+        print("Try: sudo systemctl stop llama-monitor", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Shutdown failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if resp.status_code != 200:
+        print(f"API error: {resp.status_code} - {resp.text}", file=sys.stderr)
+        sys.exit(1)
+
+    print("Shutdown initiated. Waiting for daemon to stop...")
+    for _ in range(20):
+        time.sleep(0.5)
+        if _daemon_api_alive() is False:
+            print("Daemon stopped.")
+            sys.exit(0)
+    print("Daemon did not stop within timeout.", file=sys.stderr)
+    sys.exit(1)
+
+
+def _daemon_api_alive() -> Optional[bool]:
+    """True if the daemon API answers, False if not, None if undetermined."""
+    import httpx
+    try:
+        with httpx.Client(timeout=2) as client:
+            resp = client.get("http://127.0.0.1:9500/api/v1/status")
+            return resp.status_code == 200
+    except httpx.ConnectError:
+        return False
+    except Exception:
+        return None
+
+
 def cmd_stop():
-    """Send SIGTERM to the running daemon."""
+    """Stop the running daemon.
+
+    Signals the PID directly when permitted, otherwise uses the daemon API
+    (which does not require root).
+    """
     import signal as sig
-    
+
     pid_file = _get_pid_file()
     try:
         if not pid_file.exists():
             fallback = _get_pid_file_fallback()
             if fallback and fallback.exists():
                 pid_file = fallback
-            else:
-                print("No daemon PID file found. Is the daemon running?")
-                sys.exit(1)
     except PermissionError:
-        print("No daemon PID file found. Is the daemon running?")
-        sys.exit(1)
-    
+        pass
+
+    pid = None
     try:
         pid = int(pid_file.read_text().strip())
-    except ValueError:
-        print(f"Invalid PID file: {pid_file}")
-        sys.exit(1)
-    except PermissionError:
-        print("Permission denied reading PID file. Is the daemon running as a different user?")
-        sys.exit(1)
+    except (ValueError, OSError):
+        pass  # missing, unreadable or malformed — try the API below
+
+    if pid is None:
+        _stop_via_api()
     
     try:
         os.kill(pid, sig.SIGTERM)
@@ -426,42 +532,18 @@ def cmd_stop():
         print("Daemon not running (stale PID file).")
         pid_file.unlink(missing_ok=True)
     except PermissionError:
-        # We can't signal the daemon directly (e.g. root-owned, run as n4rf).
-        # Shut it down via the HTTP API.
-        print("Daemon owned by another user. Shutting down via API...")
-        import httpx
-        try:
-            with httpx.Client(timeout=5) as client:
-                resp = client.post("http://127.0.0.1:9500/api/v1/shutdown")
-                if resp.status_code == 200:
-                    print("Shutdown initiated. Waiting for daemon to stop...")
-                    for _ in range(20):
-                        time.sleep(0.5)
-                        try:
-                            os.kill(pid, 0)
-                        except ProcessLookupError:
-                            print("Daemon stopped.")
-                            pid_file.unlink(missing_ok=True)
-                            sys.exit(0)
-                        except PermissionError:
-                            pass  # still running
-                    print("Daemon did not stop within timeout.", file=sys.stderr)
-                    sys.exit(1)
-                else:
-                    print(f"API error: {resp.status_code} - {resp.text}",
-                          file=sys.stderr)
-                    sys.exit(1)
-        except httpx.ConnectError:
-            print("Cannot connect to daemon API.", file=sys.stderr)
-            print("Try: sudo systemctl stop llama-monitor", file=sys.stderr)
-            sys.exit(1)
-        except Exception as e:
-            print(f"Shutdown failed: {e}", file=sys.stderr)
-            sys.exit(1)
+        # Daemon is owned by another user (root) — use the API instead.
+        _stop_via_api()
 
 
 def cmd_restart():
     """Restart the daemon."""
+    if os.geteuid() != 0:
+        # Starting the daemon needs root; stop unprivileged via the API first,
+        # then hand the actual start to the elevation path.
+        cmd_stop()
+        time.sleep(1)
+        _elevate(["start"])
     cmd_stop()
     time.sleep(1)
     cmd_start()
@@ -936,11 +1018,17 @@ def _prompt_binary_selection(default_binary=None):
     return default_binary
 
 
-def _collect_parameters(template):
+def _collect_parameters(template, ask_all=None):
     """Interactively prompt for the binary + all template parameters.
 
     Uses the current values in ``template`` as defaults and updates
     ``template`` in place. Returns the template.
+
+    Every parameter llama-server is invoked with (see
+    ``daemon._build_llama_args``) has an entry in :data:`PARAM_SPECS`. Where a
+    parameter has defined values it is offered as a numbered select list with
+    a trailing "custom" entry that prompts for a free-form value; otherwise a
+    plain free-form prompt is used.
     """
     # Binary selection
     binaries = _find_llama_servers()
@@ -951,94 +1039,435 @@ def _collect_parameters(template):
             template["binary"] = chosen
             print(f"  -> {chosen}")
 
-    defaults = dict(template)
+    if ask_all is None:
+        ask_all = _prompt_yes(
+            "  Configure every supported llama-server parameter?", default=True)
 
-    # Port
-    v = _prompt_input("  Port", str(defaults.get("port", 8080)))
-    if v:
-        template["port"] = int(v)
+    if not ask_all:
+        return template
 
-    # Bind address
-    v = _prompt_input("  Bind address", defaults.get("bind", "127.0.0.1"))
-    if v:
-        template["bind"] = v
+    specs = _runtime_specs(template.get("binary"))
+    if not specs:
+        specs = PARAM_SPECS
 
-    # Context size
-    v = _prompt_input("  Context size", str(defaults.get("ctx_size", 262144)))
-    if v:
-        template["ctx_size"] = int(v)
+    current_group = None
+    for spec in specs:
+        if spec.key not in template and not spec.always_ask:
+            continue
+        if spec.group != current_group:
+            current_group = spec.group
+            print(f"\n--- {current_group} ---")
 
-    # GPU layers
-    v = _prompt_input("  GPU layers", str(defaults.get("n_gpu_layers", 99)))
-    if v:
-        template["n_gpu_layers"] = int(v)
-
-    # n_cpu_moe
-    v = _prompt_input("  n_cpu_moe", str(defaults.get("n_cpu_moe", 41)))
-    if v:
-        template["n_cpu_moe"] = int(v)
-
-    # Flash attention
-    v = _prompt_input("  Flash attention", defaults.get("flash_attn", "on"))
-    if v:
-        template["flash_attn"] = v
-
-    # Parallel
-    v = _prompt_input("  Parallel", str(defaults.get("parallel", 1)))
-    if v:
-        template["parallel"] = int(v)
-
-    # Load mode
-    v = _prompt_input("  Load mode", defaults.get("load_mode", "mmap+mlock"))
-    if v:
-        template["load_mode"] = v
-
-    # Cache type K
-    v = _prompt_input("  Cache type K", defaults.get("cache_type_k", "turbo4"))
-    if v:
-        template["cache_type_k"] = v
-
-    # Cache type V
-    v = _prompt_input("  Cache type V", defaults.get("cache_type_v", "turbo3"))
-    if v:
-        template["cache_type_v"] = v
-
-    # Jinja
-    v = _prompt_input("  Jinja format (on/off)", str(defaults.get("jinja", True)))
-    if v:
-        template["jinja"] = v.lower() in ("on", "true", "1")
-
-    # Temperature
-    v = _prompt_input("  Temperature", str(defaults.get("temperature", 1.0)))
-    if v:
-        template["temperature"] = float(v)
-
-    # Top-p
-    v = _prompt_input("  Top-p", str(defaults.get("top_p", 0.95)))
-    if v:
-        template["top_p"] = float(v)
-
-    # Top-k
-    v = _prompt_input("  Top-k", str(defaults.get("top_k", 20)))
-    if v:
-        template["top_k"] = int(v)
-
-    # Min-p
-    v = _prompt_input("  Min-p", str(defaults.get("min_p", 0.00)))
-    if v:
-        template["min_p"] = float(v)
-
-    # Spec type
-    v = _prompt_input("  Spec type", defaults.get("spec_type", "draft-mtp"))
-    if v:
-        template["spec_type"] = v
-
-    # Draft n-max
-    v = _prompt_input("  Draft n-max", str(defaults.get("spec_draft_n_max", 2)))
-    if v:
-        template["spec_draft_n_max"] = int(v)
+        current = template.get(spec.key, spec.default)
+        value = _prompt_spec(spec, current)
+        if value is not None:
+            template[spec.key] = value
 
     return template
+
+
+class _ParamSpec:
+    """One llama-server parameter offered by the wizard."""
+
+    __slots__ = ("key", "label", "kind", "options", "default", "group",
+                 "always_ask", "help")
+
+    def __init__(self, key, label, kind="int", options=None, default=None,
+                 group="Other", always_ask=False, help=""):
+        self.key = key
+        self.label = label
+        self.kind = kind  # int | float | bool | str | select
+        self.options = options or []  # list of (value, display)
+        self.default = default
+        self.group = group
+        self.always_ask = always_ask  # ask even if absent from the template
+        self.help = help
+
+
+def _ctx_options():
+    """Standard context sizes: n*1024 tokens for n in 8..256."""
+    return [(n * 1024, f"{n}k ({n * 1024})") for n in range(8, 257)]
+
+
+_CACHE_TYPES = [
+    "f32", "f16", "bf16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0",
+    "iq4_nl", "iq4_xs", "turbo2", "turbo3", "turbo4",
+]
+
+PARAM_SPECS = [
+    # --- Server ---
+    _ParamSpec("port", "Port", kind="int", default=8080, group="Server",
+               always_ask=True, help="TCP port llama-server listens on"),
+    _ParamSpec("bind", "Bind address", kind="select", default="127.0.0.1",
+               options=[("127.0.0.1", "127.0.0.1 (localhost only)"),
+                        ("0.0.0.0", "0.0.0.0 (all interfaces)"),
+                        ("::", ":: (all interfaces, IPv6)")],
+               group="Server", always_ask=True, help="--host"),
+
+    # --- Model loading ---
+    _ParamSpec("ctx_size", "Context size", kind="select", default=262144,
+               options=_ctx_options(), group="Model loading",
+               always_ask=True, help="--ctx-size, in tokens"),
+    _ParamSpec("n_gpu_layers", "GPU layers", kind="int", default=99,
+               group="Model loading", help="-1 = all, 0 = CPU only"),
+    _ParamSpec("n_cpu_moe", "CPU MoE layers", kind="int", default=41,
+               group="Model loading", help="Mixture-of-experts layers kept on CPU"),
+    _ParamSpec("flash_attn", "Flash attention", kind="select", default="on",
+               options=[("on", "on"), ("off", "off"), ("auto", "auto")],
+               group="Model loading"),
+    _ParamSpec("load_mode", "Load mode", kind="select", default="mmap+mlock",
+               options=[("mmap", "mmap"), ("mlock", "mlock"),
+                        ("mmap+mlock", "mmap+mlock")],
+               group="Model loading"),
+
+    # --- KV cache ---
+    _ParamSpec("cache_type_k", "Cache type K", kind="select", default="f16",
+               options=[(t, t) for t in _CACHE_TYPES], group="KV cache"),
+    _ParamSpec("cache_type_v", "Cache type V", kind="select", default="f16",
+               options=[(t, t) for t in _CACHE_TYPES], group="KV cache"),
+
+    # --- Sampling ---
+    _ParamSpec("temperature", "Temperature", kind="float", default=1.0,
+               group="Sampling"),
+    _ParamSpec("top_p", "Top-p", kind="float", default=0.95, group="Sampling"),
+    _ParamSpec("top_k", "Top-k", kind="int", default=40, group="Sampling"),
+    _ParamSpec("min_p", "Min-p", kind="float", default=0.05, group="Sampling"),
+    _ParamSpec("mirostat", "Mirostat", kind="select", default=0,
+               options=[(0, "0 (disabled)"), (1, "1"), (2, "2")],
+               group="Sampling"),
+    _ParamSpec("mirostat_lr", "Mirostat learning rate (tau)", kind="float",
+               default=0.1, group="Sampling"),
+    _ParamSpec("mirostat_ent", "Mirostat target entropy (eta)", kind="float",
+               default=5.0, group="Sampling"),
+    _ParamSpec("repeat_last_n", "Repeat last-n", kind="int", default=64,
+               group="Sampling"),
+    _ParamSpec("repeat_penalty", "Repeat penalty", kind="float", default=1.0,
+               group="Sampling"),
+    _ParamSpec("frequency_penalty", "Frequency penalty", kind="float", default=0.0,
+               group="Sampling"),
+    _ParamSpec("presence_penalty", "Presence penalty", kind="float", default=0.0,
+               group="Sampling"),
+    _ParamSpec("seed", "Seed", kind="int", default=0,
+               group="Sampling", help="0 = random"),
+    _ParamSpec("logit_bias", "Logit bias", kind="str", default="",
+               group="Sampling", help='e.g. "token_id:-100"'),
+
+    # --- Speculative decoding ---
+    _ParamSpec("spec_type", "Spec type", kind="select", default="none",
+               options=[("none", "none (disabled)"),
+                        ("draft-model", "draft-model"),
+                        ("draft-min", "draft-min"),
+                        ("draft-max", "draft-max"),
+                        ("draft-mtp", "draft-mtp"),
+                        ("draft-tmtp", "draft-tmtp")],
+               group="Speculative decoding"),
+    _ParamSpec("spec_draft_n_max", "Draft n-max", kind="int", default=2,
+               group="Speculative decoding"),
+
+    # --- Server features ---
+    _ParamSpec("jinja", "Jinja chat template", kind="bool", default=True,
+               group="Server features", always_ask=True),
+    _ParamSpec("metrics", "Metrics endpoint", kind="bool", default=True,
+               group="Server features", always_ask=True),
+    _ParamSpec("chat_format", "Chat format", kind="select", default="",
+               options=[("", "server default (unset)"), ("chatml", "chatml"),
+                        ("llama2", "llama2"), ("llama3", "llama3"),
+                        ("zephyr", "zephyr"), ("mistral-instruct", "mistral-instruct"),
+                        ("gemma", "gemma"), ("phi3", "phi3"), ("qwen", "qwen")],
+               group="Server features"),
+
+    # --- Multi-GPU / distributed ---
+    _ParamSpec("parallel", "Parallel slots", kind="int", default=1,
+               group="Multi-GPU / distributed", always_ask=True,
+               help="-1 = auto"),
+    _ParamSpec("split_mode", "Split mode", kind="select", default="none",
+               options=[("none", "none (single GPU)"), ("layer", "layer"),
+                        ("row", "row")],
+               group="Multi-GPU / distributed"),
+    _ParamSpec("tensor_split", "Tensor split", kind="str", default="",
+               group="Multi-GPU / distributed", help='e.g. "3,1"'),
+    _ParamSpec("main_gpu", "Main GPU index", kind="int", default=0,
+               group="Multi-GPU / distributed"),
+
+    # --- LoRA ---
+    _ParamSpec("lora", "LoRA adapter", kind="str", default="",
+               group="LoRA", help="path to the LoRA adapter"),
+]
+
+_CUSTOM = object()
+
+
+# JSON key -> long llama-server flag, mirroring daemon._build_llama_args.
+_PARAM_FLAGS = {
+    "port": "--port",
+    "bind": "--host",
+    "ctx_size": "--ctx-size",
+    "n_gpu_layers": "--n-gpu-layers",
+    "n_cpu_moe": "--n-cpu-moe",
+    "flash_attn": "--flash-attn",
+    "load_mode": "--load-mode",
+    "cache_type_k": "--cache-type-k",
+    "cache_type_v": "--cache-type-v",
+    "temperature": "--temp",
+    "top_p": "--top-p",
+    "top_k": "--top-k",
+    "min_p": "--min-p",
+    "mirostat": "--mirostat",
+    "mirostat_lr": "--mirostat-lr",
+    "mirostat_ent": "--mirostat-ent",
+    "repeat_last_n": "--repeat-last-n",
+    "repeat_penalty": "--repeat-penalty",
+    "frequency_penalty": "--frequency-penalty",
+    "presence_penalty": "--presence-penalty",
+    "seed": "--seed",
+    "logit_bias": "--logit-bias",
+    "spec_type": "--spec-type",
+    "spec_draft_n_max": "--spec-draft-n-max",
+    "jinja": "--jinja",
+    "metrics": "--metrics",
+    "chat_format": "--chat-format",
+    "parallel": "--parallel",
+    "split_mode": "--split-mode",
+    "tensor_split": "--tensor-split",
+    "main_gpu": "--main-gpu",
+    "lora": "--lora",
+}
+
+_HELP_CACHE: dict = {}
+
+
+def _llama_server_help(binary: str) -> str:
+    """Run ``<binary> --help`` once and cache the output."""
+    if binary not in _HELP_CACHE:
+        try:
+            result = subprocess.run([binary, "--help"], capture_output=True,
+                                    text=True, timeout=10)
+            _HELP_CACHE[binary] = result.stdout or ""
+        except (OSError, subprocess.SubprocessError):
+            _HELP_CACHE[binary] = ""
+    return _HELP_CACHE[binary]
+
+
+def _help_flag_block(help_text: str, flag: str) -> Optional[str]:
+    """Return the flag's help entry plus its indented continuation lines."""
+    lines = help_text.splitlines()
+    for i, line in enumerate(lines):
+        # Require a word boundary so --port does not match --parallel.
+        if not re.search(r"(?<![\w-])" + re.escape(flag) + r"(?![\w-])", line):
+            continue
+        block = [line]
+        for follow in lines[i + 1:]:
+            if not follow.strip():
+                break
+            if not follow.startswith((" " * 8, "\t")):
+                break
+            block.append(follow)
+        return "\n".join(block)
+    return None
+
+
+def _help_flag_values(help_text: str, flag: str):
+    """Extract the allowed values a llama-server flag advertises in --help.
+
+    Handles the inline forms ``--flag {a,b,c}``, ``--flag [a|b|c]`` and the
+    bare ``--flag a,b,c`` (used by --spec-type), plus the multi-line forms
+    ``allowed values: a, b, c`` and ``- a: description`` bullet lists.
+    Returns a list of strings, or None when nothing is enumerated.
+    """
+    block = _help_flag_block(help_text, flag)
+    if not block:
+        return None
+    first_line = block.splitlines()[0]
+
+    inline = re.search(r"\[([^\]]+)\]|\{([^}]+)\}", first_line)
+    if inline:
+        raw = inline.group(1) or inline.group(2)
+        values = [v.strip() for v in re.split(r"[|,]", raw) if v.strip()]
+        if _is_value_list(values):
+            return values
+
+    allowed = re.search(r"allowed values:\s*([^\n]*(?:\n\s{20,}[^\n]*)*)",
+                        block, re.IGNORECASE)
+    if allowed:
+        flat = " ".join(l.strip() for l in allowed.group(1).splitlines())
+        flat = flat.split("(default")[0]
+        values = [v.strip() for v in flat.split(",") if v.strip()]
+        if _is_value_list(values):
+            return values
+
+    # Bullet list form: "- value: description"
+    bullets = re.findall(r"^\s*-\s+([A-Za-z0-9][A-Za-z0-9._+-]*)\s*:", block,
+                         re.MULTILINE)
+    if len(bullets) >= 2 and _is_value_list(bullets):
+        return bullets
+
+    # Bare form: "--flag a,b,c"
+    bare = re.search(r"(?<![\w-])" + re.escape(flag)
+                     + r"\s+([a-z0-9][a-z0-9,._-]*(?:,[a-z0-9][a-z0-9,._-]*)+)",
+                     first_line)
+    if bare:
+        values = [v.strip() for v in bare.group(1).split(",") if v.strip()]
+        if _is_value_list(values):
+            return values
+    return None
+
+
+def _is_value_list(values) -> bool:
+    """Reject placeholders like N/TYPE/MODE and stray prose."""
+    if not values:
+        return False
+    placeholders = {"n", "type", "mode", "index", "value", "num", "str", "int"}
+    return all(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", v) for v in values) \
+        and not (len(values) == 1 and values[0].lower() in placeholders)
+
+
+def _runtime_specs(binary: Optional[str]) -> list:
+    """Adapt PARAM_SPECS to the selected llama-server build.
+
+    Parameters the build does not advertise are dropped, and select lists are
+    refreshed from the value sets the build itself documents. Falls back to the
+    static PARAM_SPECS when the binary cannot be queried.
+    """
+    if not binary:
+        return PARAM_SPECS
+    help_text = _llama_server_help(binary)
+    if not help_text.strip():
+        return PARAM_SPECS
+
+    specs = []
+    for spec in PARAM_SPECS:
+        flag = _PARAM_FLAGS.get(spec.key)
+        if flag and flag not in help_text:
+            continue  # not supported by this build
+
+        if flag:
+            values = _help_flag_values(help_text, flag)
+            if values:
+                options = [(v, v) for v in values]
+                if spec.key == "split_mode":
+                    options = [(v, v) for v in values if v != "tensor"]
+                if spec.key == "spec_type":
+                    options = [(v, v) for v in values]
+                spec = _ParamSpec(
+                    spec.key, spec.label,
+                    kind="select" if spec.key not in ("cache_type_k", "cache_type_v")
+                         else spec.kind,
+                    options=options if options else spec.options,
+                    default=spec.default, group=spec.group,
+                    always_ask=spec.always_ask, help=spec.help)
+        specs.append(spec)
+    return specs
+
+
+def _prompt_spec(spec, current):
+    """Prompt for one parameter. Returns the new value, or None to keep current."""
+    if spec.kind == "select" and spec.options:
+        return _prompt_select(spec, current)
+
+    if spec.kind == "bool":
+        print(f"  {spec.label}: {'on' if current else 'off'}"
+              f"{'  ' + spec.help if spec.help else ''}")
+        if _prompt_yes(f"    {spec.label}?", default=bool(current)):
+            return True
+        return False
+
+    kind_label = {"int": "integer", "float": "number", "str": "text"}.get(
+        spec.kind, "value")
+    suffix = f"  ({spec.help})" if spec.help else ""
+    val = _prompt_input(f"  {spec.label}{suffix} [{kind_label}]",
+                        None if current is None else str(current))
+    if val is None:
+        return current
+    return _coerce(spec.kind, val, current)
+
+
+def _print_numbered(options, current_index, columns=None):
+    """Print a numbered option list, in columns when it is long."""
+    cells = []
+    for i, (_value, display) in enumerate(options, 1):
+        mark = " ◀" if i == current_index else ""
+        cells.append(f"{i:>3}. {display}{mark}")
+
+    if columns is None:
+        columns = 6 if len(cells) > 12 else 1
+    if columns <= 1:
+        for cell in cells:
+            print(f"    {cell}")
+        return
+
+    width = max(len(c) for c in cells) + 2
+    for start in range(0, len(cells), columns):
+        row = cells[start:start + columns]
+        print("    " + "".join(c.ljust(width) for c in row).rstrip())
+
+
+def _prompt_select(spec, current):
+    """Numbered select list with a trailing custom-value entry."""
+    options = list(spec.options)
+    custom_index = len(options) + 1
+    suffix = f"  ({spec.help})" if spec.help else ""
+
+    current_index = 0
+    for i, (value, _display) in enumerate(options, 1):
+        if _values_equal(value, current):
+            current_index = i
+            break
+
+    print(f"\n  {spec.label}{suffix}  [current: {_display_value(current)}]")
+    _print_numbered(options, current_index)
+    print(f"    {custom_index:>3}. custom value...")
+
+    raw = _prompt_input("    Selection", str(current_index) if current_index else "")
+    if raw is None or raw == "":
+        return current
+
+    try:
+        index = int(raw)
+    except ValueError:
+        return _coerce(spec.kind, raw, current)
+
+    if index == custom_index:
+        val = _prompt_input(f"    Custom {spec.label} value", None)
+        if val is None or val == "":
+            return current
+        return _coerce(spec.kind, val, current)
+
+    if 1 <= index <= len(options):
+        return options[index - 1][0]
+
+    print(f"    Invalid selection. Use 1-{custom_index}.")
+    return current
+
+
+def _display_value(value) -> str:
+    if value is None or value == "":
+        return "(unset)"
+    return str(value)
+
+
+def _values_equal(a, b) -> bool:
+    if a is None or b is None:
+        return a is b or (not a and not b)
+    return str(a) == str(b)
+
+
+def _coerce(kind, raw, fallback):
+    """Convert free-form input to the parameter's type, re-prompting on error."""
+    while True:
+        try:
+            if kind == "int":
+                return int(raw)
+            if kind == "float":
+                return float(raw)
+            if kind == "bool":
+                return raw.strip().lower() in ("on", "true", "1", "yes", "y")
+            return raw
+        except ValueError:
+            fallback_display = "" if fallback is None else f" [{fallback}]"
+            raw = _prompt_input(
+                f"    Not a valid {kind}{fallback_display}, try again", None)
+            if raw is None or raw == "":
+                return fallback
 
 
 def cmd_create_base():
@@ -1229,6 +1658,7 @@ def cmd_delete(template_name: Optional[str] = None):
             sys.exit(1)
 
     print(f"\nTemplate to delete: {chosen}")
+    tpl = None
     try:
         tpl = load_template(chosen)
         print(f"  Model: {tpl.get('model_path', 'unknown')}")
@@ -1275,6 +1705,54 @@ def cmd_delete(template_name: Optional[str] = None):
     except OSError as e:
         print(f"Error deleting template: {e}", file=sys.stderr)
         sys.exit(1)
+
+    # Step 3: Optionally delete the model file the template pointed at
+    _maybe_delete_model(chosen, tpl)
+
+
+def _maybe_delete_model(deleted_template: str, tpl: Optional[dict]):
+    """Offer to delete the model file referenced by the deleted template.
+
+    Skipped if the model path is unknown/missing, or if another remaining
+    template still uses the same model file.
+    """
+    if not tpl:
+        return
+
+    model_path = tpl.get("model_path")
+    if not model_path:
+        return
+
+    model_file = Path(model_path).expanduser()
+    if not model_file.is_file():
+        return
+
+    # Another template still referencing this model? Then keep the file.
+    from llama_monitor.config import list_template_names, load_template
+    for other in list_template_names():
+        try:
+            other_path = load_template(other).get("model_path")
+        except Exception:
+            continue
+        if other_path and Path(other_path).expanduser() == model_file:
+            print(f"Model file kept — still used by template '{other}': {model_file}")
+            return
+
+    try:
+        size_mb = model_file.stat().st_size / (1024 * 1024)
+    except OSError:
+        size_mb = 0
+
+    print(f"\nModel file: {model_file} ({size_mb:.0f} MB)")
+    if not _prompt_yes("Also delete the model file?", default=False):
+        print("Model file kept.")
+        return
+
+    try:
+        model_file.unlink()
+        print(f"✓ Model deleted: {model_file}")
+    except OSError as e:
+        print(f"Error deleting model file: {e}", file=sys.stderr)
 
 
 def cmd_models():

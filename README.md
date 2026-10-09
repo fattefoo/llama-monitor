@@ -92,6 +92,44 @@ Each template file defines one model configuration:
 
 All optional fields are passed as `--flag value` arguments to the llama-server.
 
+### Parameter names
+
+Each JSON key maps to one llama-server flag. The mapping is defined in
+`_build_llama_args()` (`llama_monitor/daemon.py`) and mirrored in `_PARAM_FLAGS`
+(`llama_monitor/cli.py`) for the wizard.
+
+| Template key | llama-server flag |
+| --- | --- |
+| `port` / `bind` | `--port` / `--host` |
+| `ctx_size` | `--ctx-size` |
+| `n_gpu_layers` | `--n-gpu-layers` |
+| `n_cpu_moe` | `--n-cpu-moe` |
+| `flash_attn` | `--flash-attn` |
+| `load_mode` | `--load-mode` |
+| `cache_type_k` / `cache_type_v` | `--cache-type-k` / `--cache-type-v` |
+| `temperature` | `--temp` |
+| `top_p` / `top_k` / `min_p` | `--top-p` / `--top-k` / `--min-p` |
+| `seed` / `logit_bias` | `--seed` / `--logit-bias` |
+| `mirostat` | `--mirostat` |
+| `mirostat_lr` / `mirostat_ent` | `--mirostat-lr` / `--mirostat-ent` |
+| `repeat_last_n` | `--repeat-last-n` |
+| `repeat_penalty` | `--repeat-penalty` |
+| `frequency_penalty` | `--frequency-penalty` |
+| `presence_penalty` | `--presence-penalty` |
+| `spec_type` / `spec_draft_n_max` | `--spec-type` / `--spec-draft-n-max` |
+| `jinja` / `metrics` | `--jinja` / `--metrics` (boolean flags) |
+| `parallel` | `--parallel` |
+| `split_mode` / `main_gpu` / `tensor_split` | `--split-mode` / `--main-gpu` / `--tensor-split` |
+| `lora` | `--lora` |
+
+> **Renamed keys.** Earlier versions used `penalty_last_n`, `penalty_repeat`,
+> `penalty_freq`, `penalty_present`, `mirostat_tau`, `mirostat_eta`,
+> `row_split`, `num_gpu`, `rpc`, `lora_base` and `lora_path`. Those flags do
+> **not** exist in current llama-server builds — a template using them would
+> fail to launch. They are now `repeat_last_n`, `repeat_penalty`,
+> `frequency_penalty`, `presence_penalty`, `mirostat_lr`, `mirostat_ent`,
+> `main_gpu` and `lora` as listed above. Update existing templates accordingly.
+
 ## Usage
 
 ### Daemon
@@ -112,6 +150,86 @@ llama-monitor status
 # List available templates
 llama-monitor list-templates
 ```
+
+### Privilege escalation
+
+`start` and `restart` spawn the daemon process itself and therefore need root.
+The CLI escalates without hijacking your terminal prompt:
+
+1. **Already root** — runs directly.
+2. **Graphical session** (`DISPLAY` or `WAYLAND_DISPLAY` set) — re-executes via
+   `pkexec`, so a polkit dialog asks for the password. `pkexec` sanitizes the
+   environment (including `PYTHONPATH`), so the re-execution goes through an
+   explicit interpreter call that injects the package root onto `sys.path`.
+3. **Headless / no dialog agent** — falls back to `sudo`. This is the only case
+   that prompts on the terminal, and it is unavoidable: nothing else can spawn a
+   root process.
+
+`stop` never escalates. It signals the PID file directly when permitted, and
+otherwise shuts the daemon down over its own HTTP API
+(`POST /api/v1/shutdown`), which the root daemon already serves to any local
+user. `restart` as a normal user does the same stop, then escalates for the
+start half only.
+
+### Template wizards
+
+`create-base` and `create-from` are interactive wizards that build a template
+from scratch (off `base.json`) or from an existing one.
+
+```bash
+llama-monitor create-base                # new template from base.json
+llama-monitor create-from                # copy an existing template
+llama-monitor create-from qwen36_35b     # copy a named template
+```
+
+Both wizards ask for the binary, the model, the template name and then walk
+**every** llama-server parameter, grouped into Server, Model loading, KV cache,
+Sampling, Speculative decoding, Server features, Multi-GPU/distributed and
+LoRA. Answer `n` at the "Configure every supported llama-server parameter?"
+prompt to skip the walk and keep the source template's values.
+
+**Select lists.** Any parameter with defined values is offered as a numbered
+list with the current value marked (`◀ current`) and a final
+`custom value...` entry that prompts for a free-form value. Parameters without
+a defined value set get a plain typed prompt that re-asks on invalid input.
+
+```
+  Cache type K  (--cache-type-k)  [current: turbo4]
+      1. f32        2. f16        3. bf16        4. q8_0   ◀ current
+      5. q4_0       6. q4_1       7. iq4_nl      8. q5_0
+      9. q5_1      10. turbo2    11. turbo3     12. turbo4
+     13. custom value...
+    Selection [12]
+```
+
+**Context size** is a select list of `n*1024` tokens for `n` from 8 to 256
+(249 entries), printed six per row.
+
+**Runtime introspection.** The wizard adapts itself to the selected binary: it
+runs `<binary> --help` once (cached per binary) and then
+
+- drops parameters the build does not advertise, and
+- refreshes the select lists from the value sets the build itself documents.
+
+It handles all four formats llama.cpp uses for enumerated values: the inline
+`--flash-attn [on|off|auto]` and `--split-mode {none,layer,row,tensor}` forms,
+the multi-line `allowed values: f32, f16, bf16, ...` continuation used by
+`--cache-type-k`, and the `- value: description` bullet list used by
+`--load-mode`. So on a given build `--spec-type` offers exactly the draft and
+ngram modes that build implements. If the binary cannot be queried, the static
+`PARAM_SPECS` table is used instead.
+
+### Deleting a template
+
+```bash
+llama-monitor delete              # pick from a list
+llama-monitor delete qwen36_35b   # delete a named template
+```
+
+After removing the template JSON you are asked whether to delete the model file
+too. The prompt shows the path and size. The model is **kept** without asking if
+another remaining template still references the same file. Deleting the active
+template requires an extra confirmation.
 
 ### Autostart (systemd)
 
