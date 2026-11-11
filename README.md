@@ -23,9 +23,13 @@ cd ~/llama-monitor
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e .
 
-# Install system-wide
-sudo cp scripts/llama-monitor.service /etc/systemd/system/
+# Install system-wide (binary first — the unit's ExecStart points at it)
 sudo cp llama-monitor /usr/local/bin/llama-monitor
+llama-monitor enable-autostart --sudo   # generates, enables and starts the unit
+
+# Or copy the pre-generated unit manually (must match the enable-autostart output):
+# sudo cp scripts/llama-monitor.service /etc/systemd/system/
+# sudo systemctl daemon-reload && sudo systemctl enable --now llama-monitor
 ```
 
 Or use pipx:

@@ -9,8 +9,8 @@ Restart=always
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
+Environment=HOME=/home/n4rf
 Environment=PYTHONUNBUFFERED=1
-LogsDirectory=llama-monitor
 WorkingDirectory=/home/n4rf/.config/llama-monitor
 
 [Install]

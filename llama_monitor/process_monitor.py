@@ -71,41 +71,55 @@ def is_process_zombie(pid: int) -> bool:
     return state.zombie
 
 
+def _terminated(state: ProcessState) -> bool:
+    """True when the process no longer needs any kind of kill.
+
+    A zombie counts as terminated: after SIGTERM the child may exit and
+    linger as a zombie until its parent reaps it. Treating a zombie as
+    alive would burn the whole SIGTERM→SIGKILL budget on a process that
+    is already gone, and repeatedly SIGKILLing it is a no-op.
+
+    Reaping stays the caller's job (Daemon.stop uses proc.wait()) so the
+    child's exit status stays observable.
+    """
+    return not state.alive or state.zombie
+
+
 def kill_process_graceful(pid: int, timeout_sec: int = 10) -> bool:
     """Kill a process gracefully: SIGTERM → wait → SIGKILL if needed.
-    
+
     Returns True if the process was successfully terminated.
     Returns False if the process couldn't be killed.
     """
     state = get_process_state(pid)
-    if not state.alive:
+    if _terminated(state):
         return True  # Already gone
-    
+
     try:
         # Try SIGTERM first
         os.kill(pid, signal.SIGTERM)
-        
+
         # Wait for process to exit
         deadline = time.monotonic() + timeout_sec
         while time.monotonic() < deadline:
             state = get_process_state(pid)
-            if not state.alive:
+            if _terminated(state):
                 return True
             time.sleep(0.5)
-        
+
         # Process still alive, try SIGKILL
         os.kill(pid, signal.SIGKILL)
-        
+
         # Wait a bit for SIGKILL to take effect
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             state = get_process_state(pid)
-            if not state.alive:
+            if _terminated(state):
                 return True
             time.sleep(0.25)
-        
+
         return False  # Couldn't kill after SIGKILL
-        
+
     except (ProcessLookupError, PermissionError):
         # Process gone or can't signal - effectively dead
         return True

@@ -87,17 +87,15 @@ def _has_graphical_session() -> bool:
 
 
 def _get_home_dir() -> str:
-    """Get the home directory, handling sudo correctly.
-    
-    When running via sudo, $HOME points to /root. We use SUDO_USER
-    to find the real user's home directory.
+    """Get the home directory, handling sudo and pkexec correctly.
+
+    Delegates to llama_monitor.config._get_home_dir, the single source of
+    truth: under pkexec, SUDO_USER is wiped and $HOME points to /root, so the
+    /home/* config scan is required to resolve the real user's home (the
+    enable-autostart service generation depends on it).
     """
-    home = os.path.expanduser("~")
-    if home == "/root":
-        sudo_user = os.environ.get("SUDO_USER")
-        if sudo_user:
-            return os.path.expanduser(f"~{sudo_user}")
-    return home
+    from llama_monitor.config import _get_home_dir as _config_get_home_dir
+    return _config_get_home_dir()
 
 
 def main():
@@ -274,6 +272,21 @@ def _get_pid_file_fallback() -> Optional[Path]:
     except PermissionError:
         pass
     return None
+
+
+def _restart_timeout_sec() -> int:
+    """Read restart_timeout_sec from the config (default 10).
+
+    Used to size the stop paths' wait windows: the daemon's shutdown handler
+    stops the llama-server first, letting SIGTERM take effect for up to
+    restart_timeout_sec before escalating to SIGKILL. Aborting the CLI wait
+    earlier and SIGKILLing the daemon would orphan the llama-server.
+    """
+    try:
+        from llama_monitor.config import load_config
+        return int(load_config().get("restart_timeout_sec", 10))
+    except Exception:
+        return 10
 
 
 def _get_service_file() -> Path:
@@ -470,7 +483,13 @@ def _stop_via_api():
         sys.exit(1)
 
     print("Shutdown initiated. Waiting for daemon to stop...")
-    for _ in range(20):
+    # Give the daemon's finally block room to stop the llama-server
+    # gracefully (SIGTERM wait up to restart_timeout_sec + SIGKILL escalation
+    # poll + signal handling latency). Ending the wait early is not fatal —
+    # the daemon keeps tearing down — but SIGKILL here would orphan the
+    # llama-server, so this loop never kills anything.
+    deadline = time.monotonic() + _restart_timeout_sec() + 15
+    while time.monotonic() < deadline:
         time.sleep(0.5)
         if _daemon_api_alive() is False:
             print("Daemon stopped.")
@@ -521,23 +540,33 @@ def cmd_stop():
     try:
         os.kill(pid, sig.SIGTERM)
         print(f"Sent SIGTERM to daemon (PID {pid}). Waiting for shutdown...")
-        
-        # Wait up to 10 seconds
-        for _ in range(20):
-            time.sleep(0.5)
+
+        # The daemon's shutdown handler stops the llama-server FIRST
+        # (SIGTERM wait up to restart_timeout_sec, then SIGKILL escalation).
+        # Killing the daemon here earlier would orphan the llama-server,
+        # so the wait budget covers the full graceful teardown.
+        grace = _restart_timeout_sec() + 18
+        t0 = time.monotonic()
+
+        got = False
+        while time.monotonic() - t0 < grace:
+            time.sleep(0.25)
             try:
                 os.kill(pid, 0)
             except ProcessLookupError:
-                print("Daemon stopped.")
-                pid_file.unlink(missing_ok=True)
-                sys.exit(0)
-        
+                got = True
+                break
+        if got:
+            print("Daemon stopped.")
+            pid_file.unlink(missing_ok=True)
+            sys.exit(0)
+
         print("Daemon did not stop gracefully. Sending SIGKILL...", file=sys.stderr)
         os.kill(pid, sig.SIGKILL)
         time.sleep(1)
         pid_file.unlink(missing_ok=True)
         print("Daemon killed.")
-        
+
     except ProcessLookupError:
         print("Daemon not running (stale PID file).")
         pid_file.unlink(missing_ok=True)
@@ -798,15 +827,20 @@ def cmd_list_templates():
 def cmd_enable_autostart(sudo: bool = False):
     """Create and enable systemd service."""
     # Check for root permissions first
-    if not (sudo or os.geteuid() == 0):
-        print(
-            "Error: --enable-autostart requires root privileges.\n"
-            "Usage:\n"
-            "  sudo llama-monitor enable-autostart\n"
-            "  llama-monitor enable-autostart --sudo\n",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    if os.geteuid() != 0:
+        if not sudo:
+            print(
+                "Error: --enable-autostart requires root privileges.\n"
+                "Usage:\n"
+                "  sudo llama-monitor enable-autostart\n"
+                "  llama-monitor enable-autostart --sudo\n",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        # --sudo promises elevation: re-exec as root via pkexec (GUI dialog)
+        # or sudo, like start/restart. The elevated child runs this command
+        # again with euid 0 and performs the write + systemctl steps itself.
+        _elevate(["enable-autostart"])
     
     service_file = _get_service_file()
     config_dir = Path(os.path.join(_get_home_dir(), ".config", "llama-monitor"))
@@ -848,15 +882,18 @@ WantedBy=multi-user.target
 def cmd_disable_autostart(sudo: bool = False):
     """Disable and remove systemd service."""
     # Check for root permissions first
-    if not (sudo or os.geteuid() == 0):
-        print(
-            "Error: --disable-autostart requires root privileges.\n"
-            "Usage:\n"
-            "  sudo llama-monitor disable-autostart\n"
-            "  llama-monitor disable-autostart --sudo\n",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    if os.geteuid() != 0:
+        if not sudo:
+            print(
+                "Error: --disable-autostart requires root privileges.\n"
+                "Usage:\n"
+                "  sudo llama-monitor disable-autostart\n"
+                "  llama-monitor disable-autostart --sudo\n",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        # Same elevation contract as cmd_enable_autostart.
+        _elevate(["disable-autostart"])
     
     service_file = _get_service_file()
     

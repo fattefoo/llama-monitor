@@ -12,16 +12,16 @@ from pathlib import Path
 from typing import Optional
 
 def _get_home_dir() -> str:
-    """Get the home directory, handling sudo correctly.
-    
-    When running via sudo, $HOME points to /root. We use SUDO_USER
-    to find the real user's home directory. SUDO_USER takes priority
-    over HOME.
+    """Get the home directory, handling sudo/pkexec correctly.
+
+    Must resolve to the SAME directory as llama_monitor.config._get_home_dir:
+    the daemon runs as root (pkexec/sudo), while the CLI runs as the user.
+    If the daemon wrote its PID file under /root/.config, the unprivileged
+    CLI could never find it and every `stop` would fall through to the API
+    path instead of signalling the PID directly.
     """
-    sudo_user = os.environ.get("SUDO_USER")
-    if sudo_user:
-        return os.path.expanduser(f"~{sudo_user}")
-    return os.path.expanduser("~")
+    from llama_monitor.config import _get_home_dir as _config_get_home_dir
+    return _config_get_home_dir()
 
 
 CONFIG_HOME = Path(_get_home_dir())
@@ -243,10 +243,20 @@ class Daemon:
             # Start log reader thread
             threading.Thread(target=self._read_logs, args=(self.proc,), daemon=True, name="llama-log-reader").start()
             
-            # Brief wait to see if it crashes immediately
-            self.proc.wait(timeout=5)
-            
-            if self.proc.returncode == 0:
+            # Brief wait to see if it crashes immediately — polled in short
+            # steps instead of a blocking wait(): a blocking proc.wait()
+            # defers SIGTERM handling in the main thread for up to 5s, which
+            # eats into the shutdown path's window for stopping the
+            # llama-server gracefully.
+            crash_deadline = time.monotonic() + 5
+            while self.proc.poll() is None and time.monotonic() < crash_deadline:
+                time.sleep(0.25)
+
+            if self.proc.returncode is None:
+                # Still running after the grace window — healthy start
+                state.process_state = "running"
+                print(f"llama-server started successfully (PID {self.proc.pid})", flush=True)
+            elif self.proc.returncode == 0:
                 state.process_state = "running"
                 print(f"llama-server started (PID {self.proc.pid}) - exited cleanly? Checking again...", flush=True)
                 # Actually, if it exited cleanly after 5s, something might be wrong
@@ -254,11 +264,7 @@ class Daemon:
             else:
                 state.process_state = "crashed"
                 print(f"llama-server crashed with code {self.proc.returncode}", file=sys.stderr, flush=True)
-            
-        except subprocess.TimeoutExpired:
-            # Process is still running after 5s - that's good!
-            state.process_state = "running"
-            print(f"llama-server started successfully (PID {self.proc.pid})", flush=True)
+
         except FileNotFoundError:
             state.process_state = "stopped"
             print(f"Binary not found: {args[0]}", file=sys.stderr, flush=True)
@@ -289,9 +295,14 @@ class Daemon:
             # We started this server — kill it (or force killing external)
             state.process_state = "killing"
             print(f"Stopping llama-server (PID {pid})...", flush=True)
-            
+
             success = kill_process_graceful(pid, timeout_sec)
-            
+
+            # Reap the exited child. Without this the llama-server lingers
+            # as a zombie, `ps` keeps reporting it as alive, and restart
+            # cycles assume the old server is still running.
+            self._reap_child()
+
             if success:
                 state.process_state = "stopped"
                 state.pid = None
@@ -312,7 +323,19 @@ class Daemon:
         
         self.proc = None
         return True
-    
+
+    def _reap_child(self, timeout: float = 3.0) -> None:
+        """Wait for the spawned llama-server child so it does not become a zombie."""
+        if self.proc is None:
+            return
+        try:
+            self.proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # Still alive — leave it; kill_process_graceful already escalated.
+            pass
+        except Exception:
+            pass
+
     def restart(self, force_kill: bool = False) -> bool:
         """Stop then start with the current template.
         
@@ -511,8 +534,8 @@ def run_daemon(config: dict) -> None:
             print(f"Autostart: llama-server already running on port {tpl_port} "
                   f"(PID {existing_server['pid']}). Adopting for monitoring.", flush=True)
             daemon._health_url = f"http://127.0.0.1:{tpl_port}/health"
-            state.pid = existing_server["pid"]
-            state.server_owned = False
+            _global_state.pid = existing_server["pid"]
+            _global_state.server_owned = False
         else:
             print("Autostart enabled - launching template...", flush=True)
             daemon.start(_global_state.active_template)
