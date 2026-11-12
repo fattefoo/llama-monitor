@@ -958,6 +958,7 @@ def _get_model_files():
 
 def _models_with_templates():
     """Return set of model file basenames that have templates."""
+    from llama_monitor.config import list_template_names, load_template
     templates = list_template_names()
     result = set()
     for tname in templates:
